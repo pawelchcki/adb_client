@@ -12,6 +12,7 @@ use crate::{BinaryDecodable, Result, RustADBError};
 // Do not advertise shell_v2 or delayed_ack until implemented here.
 const VERSION: u32 = 0x0100_0000;
 const MAX_PAYLOAD: usize = 64 * 1024;
+const MAX_STALE: usize = 8;
 
 pub(super) fn invalid(message: &str) -> RustADBError {
     RustADBError::ADBRequestFailed(message.into())
@@ -28,6 +29,7 @@ pub(super) struct Connection<T> {
     max_payload: usize,
     next_id: u32,
     usable: bool,
+    last_closed: Option<(u32, u32)>,
 }
 
 impl<T: Transport> Connection<T> {
@@ -37,6 +39,7 @@ impl<T: Transport> Connection<T> {
             max_payload: MAX_PAYLOAD,
             next_id: 0,
             usable: false,
+            last_closed: None,
         };
         this.send(
             Command::Cnxn,
@@ -47,6 +50,7 @@ impl<T: Transport> Connection<T> {
         .await?;
         let mut signed = false;
         let mut offered = false;
+        let mut stale = 0;
         loop {
             let message = this.receive().await?;
             match message.header().command() {
@@ -77,6 +81,11 @@ impl<T: Transport> Connection<T> {
                     } else {
                         return Err(invalid("ADB host key was not authorized"));
                     }
+                }
+                Command::Okay | Command::Write | Command::Clse if stale < MAX_STALE => {
+                    // USB can retain terminal packets from the prior session.
+                    // A fresh CNXN resets those old streams; never reuse their IDs.
+                    stale += 1;
                 }
                 _ => return Err(invalid("Expected ADB CNXN or authentication token")),
             }
@@ -128,6 +137,23 @@ impl<T: Transport> Connection<T> {
         Ok(())
     }
 
+    async fn receive_current(&mut self) -> Result<Message> {
+        for _ in 0..=MAX_STALE {
+            let message = self.receive().await?;
+            // Some adbd implementations repeat CLSE after our final CLSE.
+            // Ignore only the exact already-closed stream, never an unknown
+            // ID, a refused new OPEN, an OKAY, or a malformed close payload.
+            if message.header().command() == Command::Clse
+                && message.payload().is_empty()
+                && self.last_closed == Some((message.header().arg0(), message.header().arg1()))
+            {
+                continue;
+            }
+            return Ok(message);
+        }
+        Err(invalid("Too many repeated ADB close packets"))
+    }
+
     pub(super) async fn open(&mut self, service: &str) -> Result<Stream<'_, T>> {
         if !self.usable {
             return Err(invalid(
@@ -148,8 +174,13 @@ impl<T: Transport> Connection<T> {
         let mut destination = service.as_bytes().to_vec();
         destination.push(0);
         self.send(Command::Open, local, 0, &destination).await?;
-        let response = self.receive().await?;
-        response.assert_command(Command::Okay)?;
+        let response = self.receive_current().await?;
+        if response.header().command() != Command::Okay {
+            return Err(invalid(&format!(
+                "ADB service open received {}, expected OKAY",
+                response.header().command()
+            )));
+        }
         if response.header().arg1() != local
             || response.header().arg0() == 0
             || !response.payload().is_empty()
@@ -190,7 +221,7 @@ impl<T: Transport> Stream<'_, T> {
     }
 
     async fn receive(&mut self) -> Result<Message> {
-        let message = self.connection.receive().await?;
+        let message = self.connection.receive_current().await?;
         if message.header().arg0() != self.remote || message.header().arg1() != self.local {
             return Err(invalid("ADB stream ID mismatch"));
         }
@@ -226,6 +257,7 @@ impl<T: Transport> Stream<'_, T> {
                     .send(Command::Clse, self.local, self.remote, &[])
                     .await?;
                 self.closed = true;
+                self.connection.last_closed = Some((self.remote, self.local));
                 self.connection.usable = true;
                 Ok(None)
             }
@@ -274,6 +306,7 @@ impl<T: Transport> Stream<'_, T> {
         }
         self.pending = None;
         self.closed = true;
+        self.connection.last_closed = Some((self.remote, self.local));
         self.connection.usable = true;
         Ok(())
     }

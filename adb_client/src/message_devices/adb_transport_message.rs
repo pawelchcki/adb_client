@@ -129,6 +129,7 @@ impl ADBTransportMessage {
             && ADBTransportMessageHeader::compute_crc32(&self.payload) == self.header.data_crc32
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn assert_command(&self, expected_command: MessageCommand) -> Result<()> {
         let our_command = self.header().command();
         if expected_command == our_command {

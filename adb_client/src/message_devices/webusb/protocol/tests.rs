@@ -270,3 +270,91 @@ fn cancelled_read_or_open_requires_reconnect_and_bad_names_do_not_send() {
         }
     });
 }
+
+#[test]
+fn duplicate_terminal_close_does_not_reject_the_next_shell() {
+    block_on(async {
+        let fake = Fake::new(&[
+            connected(),
+            message(Command::Okay, 7, 1, &[]),
+            message(Command::Write, 7, 1, b"22\n"),
+            message(Command::Clse, 7, 1, &[]),
+            message(Command::Clse, 7, 1, &[]),
+            message(Command::Okay, 8, 2, &[]),
+            message(Command::Clse, 7, 1, &[]),
+            message(Command::Write, 8, 2, b"Fire\n"),
+            message(Command::Clse, 8, 2, &[]),
+        ]);
+        let mut connection = Connection::connect(fake, key()).await.unwrap();
+        let mut first = connection
+            .open("shell:getprop ro.build.version.sdk")
+            .await
+            .unwrap();
+        assert_eq!(first.read().await.unwrap(), Some(b"22\n".to_vec()));
+        assert!(first.read().await.unwrap().is_none());
+        drop(first);
+        let mut second = connection
+            .open("shell:getprop ro.product.model")
+            .await
+            .unwrap();
+        assert_eq!(second.read().await.unwrap(), Some(b"Fire\n".to_vec()));
+        assert!(second.read().await.unwrap().is_none());
+    });
+}
+
+#[test]
+fn fresh_handshake_drains_bounded_old_stream_packets() {
+    block_on(async {
+        let fake = Fake::new(&[
+            message(Command::Okay, 4, 1, &[]),
+            message(Command::Write, 4, 1, b"old data"),
+            message(Command::Clse, 4, 1, &[]),
+            connected(),
+        ]);
+        Connection::connect(fake, key()).await.unwrap();
+    });
+}
+
+#[test]
+fn refused_service_reports_actual_close_and_unknown_ids_still_fail() {
+    block_on(async {
+        let fake = Fake::new(&[connected(), message(Command::Clse, 0, 1, &[])]);
+        let mut connection = Connection::connect(fake, key()).await.unwrap();
+        let failure = connection.open("shell:id").await.unwrap_err().to_string();
+        assert!(failure.contains("CLSE"));
+        assert!(!failure.contains("received OKAY"));
+        assert!(connection.open("shell:id").await.is_err());
+        let fake = Fake::new(&[connected(), message(Command::Clse, 42, 99, &[])]);
+        let mut connection = Connection::connect(fake, key()).await.unwrap();
+        assert!(connection.open("shell:id").await.is_err());
+    });
+}
+
+#[test]
+fn repeated_closes_are_bounded_and_payloads_are_not_ignored() {
+    block_on(async {
+        let messages: Vec<_> = (0..=MAX_STALE)
+            .map(|_| message(Command::Clse, 7, 1, &[]))
+            .collect();
+        assert!(
+            Connection::connect(Fake::new(&messages), key())
+                .await
+                .is_err()
+        );
+        for data in [&b""[..], &b"malformed"[..]] {
+            let mut messages = vec![
+                connected(),
+                message(Command::Okay, 7, 1, &[]),
+                message(Command::Clse, 7, 1, &[]),
+            ];
+            messages.extend((0..=MAX_STALE).map(|_| message(Command::Clse, 7, 1, data)));
+            let mut connection = Connection::connect(Fake::new(&messages), key())
+                .await
+                .unwrap();
+            let mut first = connection.open("shell:id").await.unwrap();
+            assert!(first.read().await.unwrap().is_none());
+            drop(first);
+            assert!(connection.open("shell:id").await.is_err());
+        }
+    });
+}
