@@ -1,12 +1,10 @@
 use std::{
-    io::{Cursor, Read, Seek},
+    io::{Cursor, Read},
     time::{Duration, SystemTime},
 };
 
-use byteorder::ReadBytesExt;
-
 use crate::{
-    AdbStatResponse, BinaryDecodable, Result, RustADBError,
+    ADBListItem, ADBListItemType, AdbStatResponse, BinaryDecodable, Result, RustADBError,
     message_devices::{
         adb_message_transport::ADBMessageTransport,
         adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
@@ -20,6 +18,9 @@ const SYNC_DATA_MAX_SIZE: usize = 64 * 1024;
 
 /// Size of a sync chunk header (identifier and length).
 const SYNC_HEADER_SIZE: usize = 8;
+
+const LIST_ENTRIES_MAX: usize = 100_000;
+const LIST_NAME_BYTES_MAX: usize = 16 * 1024 * 1024;
 
 /// Represent a session between an `ADBDevice` and remote `adbd`.
 #[derive(Debug)]
@@ -39,10 +40,6 @@ impl<T: ADBMessageTransport> ADBSession<T> {
             remote_id,
             max_payload_size,
         }
-    }
-
-    pub const fn get_transport_mut(&mut self) -> &mut T {
-        &mut self.transport
     }
 
     pub const fn local_id(&self) -> u32 {
@@ -117,35 +114,152 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         &mut self,
         mut output: W,
     ) -> std::result::Result<(), RustADBError> {
-        let mut len: Option<u64> = None;
+        let mut payload = Cursor::new(Vec::new());
         loop {
-            let payload = self.recv_and_reply_okay()?.into_payload();
-            let mut rdr = Cursor::new(&payload);
-            while rdr.position() != payload.len() as u64 {
-                match len.take() {
-                    Some(0) | None => {
-                        rdr.seek_relative(4)?;
-                        len.replace(u64::from(rdr.read_u32::<byteorder::LittleEndian>()?));
-                    }
-                    Some(length) => {
-                        let remaining_bytes = payload.len() as u64 - rdr.position();
-                        if length < remaining_bytes {
-                            std::io::copy(&mut rdr.by_ref().take(length), &mut output)?;
-                        } else {
-                            std::io::copy(&mut rdr.take(remaining_bytes), &mut output)?;
-                            len.replace(length - remaining_bytes);
-                            // this payload is now exhausted
-                            break;
-                        }
+            let mut header = [0; 8];
+            self.read_sync_exact(&mut payload, &mut header)?;
+            let length = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+            match &header[..4] {
+                b"DONE" if length == 0 => return Ok(()),
+                b"DATA" if length <= SYNC_DATA_MAX_SIZE => {
+                    // Write directly from the received WRTE, including when a
+                    // DATA frame spans messages or shares one with other frames.
+                    let mut left = length;
+                    while left != 0 {
+                        self.ensure_sync_payload(&mut payload)?;
+                        let start = payload.position() as usize;
+                        let count = left.min(payload.get_ref().len() - start);
+                        output.write_all(&payload.get_ref()[start..start + count])?;
+                        payload.set_position((start + count) as u64);
+                        left -= count;
                     }
                 }
+                b"FAIL" if length <= SYNC_DATA_MAX_SIZE => {
+                    let mut error = vec![0; length];
+                    self.read_sync_exact(&mut payload, &mut error)?;
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "ADB file read failed: {}",
+                        String::from_utf8_lossy(&error)
+                    )));
+                }
+                _ => {
+                    return Err(RustADBError::ADBRequestFailed(
+                        "Invalid or oversized ADB sync file response".into(),
+                    ));
+                }
             }
-            if Cursor::new(&payload[(payload.len() - 8)..(payload.len() - 4)])
-                .read_u32::<byteorder::LittleEndian>()?
-                == MessageSubcommand::Done as u32
-            {
-                break;
+        }
+    }
+
+    pub(crate) fn recv_list(&mut self) -> Result<Vec<ADBListItemType>> {
+        self.recv_list_bounded(LIST_ENTRIES_MAX, LIST_NAME_BYTES_MAX)
+    }
+
+    fn recv_list_bounded(
+        &mut self,
+        max_entries: usize,
+        max_name_bytes: usize,
+    ) -> Result<Vec<ADBListItemType>> {
+        let mut payload = Cursor::new(Vec::new());
+        let mut entries = Vec::new();
+        let mut name_bytes = 0;
+        loop {
+            let mut status = [0; 4];
+            self.read_sync_exact(&mut payload, &mut status)?;
+            match &status {
+                b"DENT" | b"DONE" => {
+                    let mut metadata = [0; 16];
+                    self.read_sync_exact(&mut payload, &mut metadata)?;
+                    if &status == b"DONE" {
+                        return Ok(entries);
+                    }
+                    let number = |offset| {
+                        u32::from_le_bytes(metadata[offset..offset + 4].try_into().unwrap())
+                    };
+                    let mode = number(0);
+                    let length = number(12) as usize;
+                    if length == 0 || length > SYNC_DATA_MAX_SIZE {
+                        return Err(RustADBError::ADBRequestFailed(
+                            "Invalid or oversized ADB directory entry name".into(),
+                        ));
+                    }
+                    name_bytes += length;
+                    if entries.len() >= max_entries || name_bytes > max_name_bytes {
+                        return Err(RustADBError::ADBRequestFailed(format!(
+                            "ADB directory listing exceeds {max_entries} entries or {max_name_bytes} name bytes"
+                        )));
+                    }
+                    let mut name = vec![0; length];
+                    self.read_sync_exact(&mut payload, &mut name)?;
+                    entries.push(ADBListItemType::from_mode_and_entry(
+                        mode,
+                        ADBListItem {
+                            name: String::from_utf8(name)?,
+                            time: number(8),
+                            permissions: mode & 0o777,
+                            size: number(4),
+                        },
+                    ));
+                }
+                b"FAIL" => {
+                    let mut length = [0; 4];
+                    self.read_sync_exact(&mut payload, &mut length)?;
+                    let length = u32::from_le_bytes(length) as usize;
+                    if length > SYNC_DATA_MAX_SIZE {
+                        return Err(RustADBError::ADBRequestFailed(
+                            "Oversized ADB directory error".into(),
+                        ));
+                    }
+                    let mut error = vec![0; length];
+                    self.read_sync_exact(&mut payload, &mut error)?;
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "ADB directory read failed: {}",
+                        String::from_utf8_lossy(&error)
+                    )));
+                }
+                _ => {
+                    return Err(RustADBError::ADBRequestFailed(
+                        "Invalid ADB directory response".into(),
+                    ));
+                }
             }
+        }
+    }
+
+    // Sync is a byte stream: both headers and data may span WRTE messages,
+    // and a single WRTE may contain multiple complete sync frames.
+    fn read_sync_exact(
+        &mut self,
+        payload: &mut Cursor<Vec<u8>>,
+        mut output: &mut [u8],
+    ) -> Result<()> {
+        while !output.is_empty() {
+            self.ensure_sync_payload(payload)?;
+            let count = payload.read(output)?;
+            output = &mut output[count..];
+        }
+        Ok(())
+    }
+
+    fn ensure_sync_payload(&mut self, payload: &mut Cursor<Vec<u8>>) -> Result<()> {
+        if payload.position() == payload.get_ref().len() as u64 {
+            let message = self
+                .transport
+                .read_message_with_timeout(Duration::from_secs(30))?;
+            message.assert_command(MessageCommand::Write)?;
+            let bytes = message.into_payload();
+            if bytes.is_empty() {
+                return Err(RustADBError::ADBRequestFailed(
+                    "Empty ADB sync payload before file completion".into(),
+                ));
+            }
+            self.transport.write_message(ADBTransportMessage::try_new(
+                MessageCommand::Okay,
+                self.local_id,
+                self.remote_id,
+                &[],
+            )?)?;
+            *payload = Cursor::new(bytes);
         }
         Ok(())
     }
@@ -239,10 +353,17 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         )?)?;
 
         let response = self.transport.read_message()?;
+        response.assert_command(MessageCommand::Write)?;
         // Skip first 4 bytes as this is the literal "STAT".
         // Interesting part starts right after
 
-        AdbStatResponse::decode(&response.into_payload()[4..])
+        let payload = response.into_payload();
+        if payload.get(..4) != Some(b"STAT") {
+            return Err(RustADBError::ADBRequestFailed(
+                "Invalid ADB STAT response".into(),
+            ));
+        }
+        AdbStatResponse::decode(&payload[4..])
     }
 }
 
@@ -385,6 +506,229 @@ mod upload_tests {
             let mut session = ADBSession::new(capture.clone(), 1, 2, maximum);
             assert!(session.push_file(io::empty()).is_err());
             assert!(capture.0.lock().unwrap().frames.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod recv_tests {
+    use super::*;
+    use crate::adb_transport::ADBTransport;
+    use std::{
+        collections::VecDeque,
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Debug)]
+    struct Fake(Arc<Mutex<VecDeque<ADBTransportMessage>>>);
+    impl ADBTransport for Fake {
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl ADBMessageTransport for Fake {
+        fn read_message_with_timeout(&mut self, _: Duration) -> Result<ADBTransportMessage> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof).into())
+        }
+        fn write_message_with_timeout(
+            &mut self,
+            message: ADBTransportMessage,
+            _: Duration,
+        ) -> Result<()> {
+            assert!(matches!(
+                message.header().command(),
+                MessageCommand::Okay | MessageCommand::Write
+            ));
+            Ok(())
+        }
+    }
+    fn messages(messages: impl IntoIterator<Item = ADBTransportMessage>) -> ADBSession<Fake> {
+        ADBSession::new(
+            Fake(Arc::new(Mutex::new(messages.into_iter().collect()))),
+            1,
+            2,
+            1048576,
+        )
+    }
+    fn fragmented(bytes: &[u8], size: usize) -> ADBSession<Fake> {
+        messages(
+            bytes.chunks(size).map(|chunk| {
+                ADBTransportMessage::try_new(MessageCommand::Write, 2, 1, chunk).unwrap()
+            }),
+        )
+    }
+    fn frame(id: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
+        [id.as_slice(), &(bytes.len() as u32).to_le_bytes(), bytes].concat()
+    }
+    fn dent(mode: u32, size: u32, time: u32, name: &str) -> Vec<u8> {
+        [
+            b"DENT".as_slice(),
+            &mode.to_le_bytes(),
+            &size.to_le_bytes(),
+            &time.to_le_bytes(),
+            &(name.len() as u32).to_le_bytes(),
+            name.as_bytes(),
+        ]
+        .concat()
+    }
+    fn list_done() -> Vec<u8> {
+        [b"DONE".as_slice(), &[0; 16]].concat()
+    }
+    #[test]
+    fn directory_metadata_and_long_names_span_arbitrary_usb_messages() {
+        let name = "photo-".repeat(32);
+        let bytes = [
+            dent(0o040755, 0, 42, "."),
+            dent(0o100640, 123, 456, &name),
+            list_done(),
+        ]
+        .concat();
+        for size in [1, 2, 5, 19, 64, bytes.len()] {
+            let mut session = fragmented(&bytes, size);
+            let entries = session.recv_list().unwrap();
+            assert_eq!(
+                entries,
+                vec![
+                    ADBListItemType::Directory(ADBListItem {
+                        name: ".".into(),
+                        time: 42,
+                        permissions: 0o755,
+                        size: 0
+                    }),
+                    ADBListItemType::File(ADBListItem {
+                        name: name.clone(),
+                        time: 456,
+                        permissions: 0o640,
+                        size: 123
+                    }),
+                ]
+            );
+            assert!(session.transport.0.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn directory_truncation_and_invalid_lengths_return_errors() {
+        let bytes = [dent(0o100644, 123, 456, "photo.jpg"), list_done()].concat();
+        for end in 0..bytes.len() {
+            assert!(fragmented(&bytes[..end], 1).recv_list().is_err());
+        }
+        let mut oversized = dent(0o100644, 0, 0, "x");
+        oversized[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(fragmented(&oversized, 2).recv_list().is_err());
+        assert!(fragmented(b"BOOM", 1).recv_list().is_err());
+    }
+    #[test]
+    fn directory_listings_are_bounded_by_entries_and_name_bytes() {
+        let bytes = [
+            dent(0o100644, 0, 0, "a"),
+            dent(0o100644, 0, 0, "bb"),
+            list_done(),
+        ]
+        .concat();
+        assert_eq!(
+            fragmented(&bytes, 3).recv_list_bounded(2, 3).unwrap().len(),
+            2
+        );
+        assert!(fragmented(&bytes, 3).recv_list_bounded(1, 3).is_err());
+        assert!(fragmented(&bytes, 3).recv_list_bounded(2, 2).is_err());
+    }
+    #[test]
+    fn directory_failure_and_empty_done_are_distinct_protocol_results() {
+        let failure = frame(b"FAIL", b"Permission denied");
+        assert!(
+            fragmented(&failure, 1)
+                .recv_list()
+                .unwrap_err()
+                .to_string()
+                .contains("Permission denied")
+        );
+        assert!(fragmented(&list_done(), 1).recv_list().unwrap().is_empty());
+    }
+    #[test]
+    fn reads_fragmented_and_coalesced_frames_without_treating_file_bytes_as_done() {
+        let content = b"photo-DONE\0\0\0\0-still-photo";
+        let bytes = [
+            frame(b"DATA", content),
+            frame(b"DATA", b"tail"),
+            frame(b"DONE", b""),
+        ]
+        .concat();
+        for size in [1, 3, 7, 8, 13, bytes.len()] {
+            let mut output = Vec::new();
+            fragmented(&bytes, size).recv_file(&mut output).unwrap();
+            assert_eq!(output, [content.as_slice(), b"tail"].concat());
+        }
+        let mut output = Vec::new();
+        fragmented(&frame(b"DONE", b""), 1)
+            .recv_file(&mut output)
+            .unwrap();
+        assert!(output.is_empty());
+    }
+    #[test]
+    fn fail_frames_report_errors_without_writing_error_messages_into_the_file() {
+        let bytes = [
+            frame(b"DATA", b"partial"),
+            frame(b"FAIL", b"Permission denied"),
+        ]
+        .concat();
+        for size in [1, 5, bytes.len()] {
+            let mut output = Vec::new();
+            let error = fragmented(&bytes, size).recv_file(&mut output).unwrap_err();
+            assert!(error.to_string().contains("Permission denied"));
+            assert_eq!(output, b"partial");
+        }
+    }
+    #[test]
+    fn truncated_invalid_and_oversized_responses_return_errors_instead_of_panicking() {
+        let bytes = [frame(b"DATA", b"abc"), frame(b"DONE", b"")].concat();
+        for end in 0..bytes.len() {
+            assert!(fragmented(&bytes[..end], 1).recv_file(Vec::new()).is_err());
+        }
+        for id in [b"FAIL", b"DATA", b"BOOM"] {
+            let bytes = [id.as_slice(), &u32::MAX.to_le_bytes()].concat();
+            assert!(fragmented(&bytes, 3).recv_file(Vec::new()).is_err());
+        }
+        let close = ADBTransportMessage::try_new(MessageCommand::Clse, 2, 1, &[]).unwrap();
+        assert!(messages([close]).recv_file(Vec::new()).is_err());
+    }
+    #[test]
+    fn local_write_errors_are_propagated_for_partial_file_cleanup() {
+        struct Full;
+        impl io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = [frame(b"DATA", b"abc"), frame(b"DONE", b"")].concat();
+        assert!(
+            fragmented(&bytes, 3)
+                .recv_file(Full)
+                .unwrap_err()
+                .to_string()
+                .contains("disk full")
+        );
+    }
+    #[test]
+    fn truncated_stat_responses_return_errors_before_slicing() {
+        for bytes in [b"".as_slice(), b"S", b"STAT"] {
+            let okay = || ADBTransportMessage::try_new(MessageCommand::Okay, 2, 1, &[]).unwrap();
+            let reply = ADBTransportMessage::try_new(MessageCommand::Write, 2, 1, bytes).unwrap();
+            assert!(
+                messages([okay(), okay(), reply])
+                    .stat_with_explicit_ids("/photo.jpg")
+                    .is_err()
+            );
         }
     }
 }

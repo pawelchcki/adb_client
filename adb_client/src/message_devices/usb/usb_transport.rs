@@ -1,9 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use rusb::{
-    Context, Device, DeviceHandle, Direction, TransferType, UsbContext,
-    constants::LIBUSB_CLASS_VENDOR_SPEC,
-};
+use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
+
+use super::utils::is_adb_interface;
 
 use crate::{
     Result, RustADBError,
@@ -122,9 +121,11 @@ impl USBTransport {
                 for interface_desc in interface.descriptors() {
                     for endpoint_desc in interface_desc.endpoint_descriptors() {
                         if endpoint_desc.transfer_type() == TransferType::Bulk
-                            && interface_desc.class_code() == LIBUSB_CLASS_VENDOR_SPEC
-                            && interface_desc.sub_class_code() == 0x42
-                            && interface_desc.protocol_code() == 0x01
+                            && is_adb_interface(
+                                interface_desc.class_code(),
+                                interface_desc.sub_class_code(),
+                                interface_desc.protocol_code(),
+                            )
                         {
                             let endpoint = Endpoint {
                                 iface: interface_desc.interface_number(),

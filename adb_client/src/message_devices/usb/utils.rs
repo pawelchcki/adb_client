@@ -78,31 +78,46 @@ pub fn get_single_connected_adb_device() -> Result<Option<ADBDeviceInfo>> {
 
 /// Check whether a device with given descriptor is an ADB device
 fn is_adb_device<T: UsbContext>(device: &Device<T>, des: &DeviceDescriptor) -> bool {
-    const ADB_SUBCLASS: u8 = 0x42;
-    const ADB_PROTOCOL: u8 = 0x1;
-
-    // Some devices require choosing the file transfer mode
-    // for usb debugging to take effect.
-    const BULK_CLASS: u8 = 0xdc;
-    const BULK_ADB_SUBCLASS: u8 = 2;
-
     for n in 0..des.num_configurations() {
         let Ok(config_des) = device.config_descriptor(n) else {
             continue;
         };
         for interface in config_des.interfaces() {
             for interface_des in interface.descriptors() {
-                let proto = interface_des.protocol_code();
-                let class = interface_des.class_code();
-                let subcl = interface_des.sub_class_code();
-                if proto == ADB_PROTOCOL
-                    && ((class == LIBUSB_CLASS_VENDOR_SPEC && subcl == ADB_SUBCLASS)
-                        || (class == BULK_CLASS && subcl == BULK_ADB_SUBCLASS))
-                {
+                if is_adb_interface(
+                    interface_des.class_code(),
+                    interface_des.sub_class_code(),
+                    interface_des.protocol_code(),
+                ) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// Whether an interface uses a recognized ADB class, subclass and protocol.
+///
+/// Some devices expose the diagnostic/bulk form after enabling file transfer.
+#[must_use]
+pub const fn is_adb_interface(class: u8, subclass: u8, protocol: u8) -> bool {
+    protocol == 1
+        && ((class == LIBUSB_CLASS_VENDOR_SPEC && subclass == 0x42)
+            || (class == 0xdc && subclass == 2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_adb_interface;
+
+    #[test]
+    fn recognized_adb_interfaces_require_the_complete_signature() {
+        assert!(is_adb_interface(0xff, 0x42, 1));
+        assert!(is_adb_interface(0xdc, 2, 1));
+        assert!(!is_adb_interface(0xff, 0x42, 3)); // Fastboot is not ADB.
+        for signature in [(0xff, 2, 1), (0xdc, 0x42, 1), (0xff, 0x42, 0), (0xdc, 2, 2)] {
+            assert!(!is_adb_interface(signature.0, signature.1, signature.2));
+        }
+    }
 }

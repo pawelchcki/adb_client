@@ -25,28 +25,56 @@ pub struct ADBMessageDevice<T: ADBMessageTransport> {
     max_payload_size: usize,
 }
 
-impl<T: ADBMessageTransport> ADBMessageDevice<T> {
-    /// Instantiate a new [`ADBMessageDevice`]
-    pub fn new<P: AsRef<Path>>(mut transport: T, adb_private_key_path: P) -> Result<Self> {
-        let private_key = if let Some(private_key) = read_adb_private_key(&adb_private_key_path)? {
-            private_key
-        } else {
-            log::warn!(
-                "No private key found at path {}. Generating a new random.",
-                adb_private_key_path.as_ref().display()
-            );
-            ADBRsaKey::new_random()?
-        };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPolicy {
+    GenerateAndEnroll,
+    ExistingKey,
+    EnrollExistingKey,
+}
+impl KeyPolicy {
+    fn timeout(self) -> Option<Duration> {
+        (self != Self::GenerateAndEnroll).then_some(Duration::from_secs(10))
+    }
+}
 
-        let max_payload_size = match Self::connect(&mut transport, &private_key) {
-            Ok(max_payload_size) => max_payload_size,
-            Err(e) => {
-                // Best effort here
+impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+    /// Instantiate a new [`ADBMessageDevice`].
+    pub fn new<P: AsRef<Path>>(transport: T, path: P) -> Result<Self> {
+        Self::new_with_policy(transport, path, KeyPolicy::GenerateAndEnroll)
+    }
+
+    /// Authenticate with an existing key without generating a key or requesting enrollment.
+    pub fn new_existing_key<P: AsRef<Path>>(transport: T, path: P) -> Result<Self> {
+        Self::new_with_policy(transport, path, KeyPolicy::ExistingKey)
+    }
+
+    /// Explicitly request enrollment of an existing key; never generate a replacement.
+    pub fn new_authorize_existing_key<P: AsRef<Path>>(transport: T, path: P) -> Result<Self> {
+        Self::new_with_policy(transport, path, KeyPolicy::EnrollExistingKey)
+    }
+
+    fn new_with_policy<P: AsRef<Path>>(
+        mut transport: T,
+        path: P,
+        policy: KeyPolicy,
+    ) -> Result<Self> {
+        let private_key = if let Some(key) = read_adb_private_key(path)? {
+            key
+        } else if policy == KeyPolicy::GenerateAndEnroll {
+            log::warn!("No private key found; generating a new random key");
+            ADBRsaKey::new_random()?
+        } else {
+            return Err(RustADBError::ADBRequestFailed(
+                "Imported ADB key is missing; no key was generated".into(),
+            ));
+        };
+        let max_payload_size = match Self::connect(&mut transport, &private_key, policy) {
+            Ok(size) => size,
+            Err(error) => {
                 let _ = transport.disconnect();
-                return Err(e);
+                return Err(error);
             }
         };
-
         Ok(Self {
             transport,
             max_payload_size,
@@ -58,7 +86,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     }
 
     /// Send initial connect, and return the negotiated maximum payload size
-    fn connect(transport: &mut T, private_key: &ADBRsaKey) -> Result<usize> {
+    fn connect(transport: &mut T, private_key: &ADBRsaKey, policy: KeyPolicy) -> Result<usize> {
         transport.connect()?;
 
         let message = ADBTransportMessage::try_new(
@@ -70,11 +98,16 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         transport.write_message(message)?;
 
-        let message = Self::read_handshake_message(transport, None)?;
+        let message = Self::read_handshake_message(transport, policy.timeout())?;
 
         // Check if a client is requesting a secure connection and upgrade it if necessary
         match message.header().command() {
             MessageCommand::Stls => {
+                if policy == KeyPolicy::ExistingKey {
+                    return Err(RustADBError::ADBRequestFailed(
+                        "Existing-key USB authentication does not negotiate TLS".into(),
+                    ));
+                }
                 transport.write_message(ADBTransportMessage::try_new(
                     MessageCommand::Stls,
                     1,
@@ -84,7 +117,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 transport.upgrade_connection()?;
                 log::debug!("Connection successfully upgraded from TCP to TLS");
 
-                let message = Self::read_handshake_message(transport, None)?;
+                let message = Self::read_handshake_message(transport, policy.timeout())?;
                 Self::handle_connection(&message)
             }
             MessageCommand::Cnxn => {
@@ -93,7 +126,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             }
             MessageCommand::Auth => {
                 log::debug!("Authentication required");
-                Self::auth_handshake(transport, message, private_key)
+                Self::auth_handshake(transport, message, private_key, policy)
             }
             _ => Err(crate::RustADBError::WrongResponseReceived(
                 "Expected CNXN, STLS or AUTH command".to_string(),
@@ -133,6 +166,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         transport: &mut T,
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
+        policy: KeyPolicy,
     ) -> Result<usize> {
         // At this point, we should have received an AUTH message with arg0 == 1
         let auth_message = match message.header().arg0() {
@@ -150,11 +184,17 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         transport.write_message(message)?;
 
-        let received_response = Self::read_handshake_message(transport, None)?;
+        let received_response = Self::read_handshake_message(transport, policy.timeout())?;
 
         if received_response.header().command() == MessageCommand::Cnxn {
             log::info!("Authentication OK");
             return Self::handle_connection(&received_response);
+        }
+
+        if policy == KeyPolicy::ExistingKey {
+            return Err(RustADBError::ADBRequestFailed(
+                "Imported ADB key was rejected; no authorization request was sent".into(),
+            ));
         }
 
         let mut pubkey = private_key.android_pubkey_encode()?.into_bytes();
@@ -245,6 +285,174 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         let _discard_close = self.transport.read_message()?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod existing_key_tests {
+    use super::*;
+    use crate::adb_transport::ADBTransport;
+    use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
+    use std::{
+        collections::VecDeque,
+        fs, io,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    #[derive(Debug, Default)]
+    struct State {
+        connected: bool,
+        reads: VecDeque<ADBTransportMessage>,
+        writes: Vec<(MessageCommand, u32)>,
+        read_timeouts: Vec<Duration>,
+    }
+    #[derive(Debug, Clone)]
+    struct Fake(Arc<Mutex<State>>);
+    impl ADBTransport for Fake {
+        fn connect(&mut self) -> Result<()> {
+            self.0.lock().unwrap().connected = true;
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl ADBMessageTransport for Fake {
+        fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
+            let mut state = self.0.lock().unwrap();
+            state.read_timeouts.push(timeout);
+            state
+                .reads
+                .pop_front()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof).into())
+        }
+        fn write_message_with_timeout(
+            &mut self,
+            message: ADBTransportMessage,
+            _: Duration,
+        ) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .writes
+                .push((message.header().command(), message.header().arg0()));
+            Ok(())
+        }
+    }
+    struct Key(PathBuf);
+    impl Key {
+        fn new() -> Self {
+            static PEM: OnceLock<String> = OnceLock::new();
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let pem = PEM.get_or_init(|| {
+                RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
+                    .unwrap()
+                    .to_pkcs8_pem(Default::default())
+                    .unwrap()
+                    .to_string()
+            });
+            let path = std::env::temp_dir().join(format!(
+                "adb-existing-key-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            f.write_all(pem.as_bytes()).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Key {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn handshake(accept: bool) -> Fake {
+        let token =
+            ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_TOKEN, 0, &[7; 20]).unwrap();
+        let response = if accept {
+            ADBTransportMessage::try_new(MessageCommand::Cnxn, 0x01000000, 4096, b"device::\0")
+                .unwrap()
+        } else {
+            ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_TOKEN, 0, &[8; 20]).unwrap()
+        };
+        Fake(Arc::new(Mutex::new(State {
+            reads: VecDeque::from([token, response]),
+            ..State::default()
+        })))
+    }
+
+    #[test]
+    fn accepted_imported_key_sends_only_its_signature() {
+        let key = Key::new();
+        let fake = handshake(true);
+        assert!(ADBMessageDevice::new_existing_key(fake.clone(), &key.0).is_ok());
+        let s = fake.0.lock().unwrap();
+        assert_eq!(s.writes.len(), 2);
+        assert_eq!(s.writes[1], (MessageCommand::Auth, AUTH_SIGNATURE));
+    }
+
+    #[test]
+    fn rejected_imported_key_never_sends_an_enrollment_request() {
+        let key = Key::new();
+        let fake = handshake(false);
+        assert!(ADBMessageDevice::new_existing_key(fake.clone(), &key.0).is_err());
+        let s = fake.0.lock().unwrap();
+        assert_eq!(s.writes.len(), 2);
+        assert!(
+            !s.writes
+                .contains(&(MessageCommand::Auth, AUTH_RSAPUBLICKEY))
+        );
+    }
+
+    #[test]
+    fn missing_imported_key_fails_before_connecting_or_generating_a_key() {
+        let fake = handshake(false);
+        let path = std::env::temp_dir().join(format!("adb-missing-key-{}", std::process::id()));
+        assert!(!path.exists());
+        assert!(ADBMessageDevice::new_existing_key(fake.clone(), &path).is_err());
+        assert!(!path.exists());
+        let s = fake.0.lock().unwrap();
+        assert!(!s.connected);
+        assert!(s.writes.is_empty());
+    }
+
+    #[test]
+    fn explicit_enrollment_uses_existing_key_and_requires_device_acceptance() {
+        let key = Key::new();
+        let before = fs::read(&key.0).unwrap();
+        let fake = handshake(false);
+        fake.0.lock().unwrap().reads.push_back(
+            ADBTransportMessage::try_new(MessageCommand::Cnxn, 0x01000000, 4096, b"device::\0")
+                .unwrap(),
+        );
+        assert!(ADBMessageDevice::new_authorize_existing_key(fake.clone(), &key.0).is_ok());
+        assert_eq!(
+            fake.0.lock().unwrap().writes.last().unwrap(),
+            &(MessageCommand::Auth, AUTH_RSAPUBLICKEY)
+        );
+        assert_eq!(
+            fake.0.lock().unwrap().read_timeouts,
+            vec![Duration::from_secs(10); 3]
+        );
+        assert_eq!(fs::read(&key.0).unwrap(), before);
+        let absent =
+            std::env::temp_dir().join(format!("adb-enrollment-missing-{}", std::process::id()));
+        let fake = handshake(false);
+        assert!(ADBMessageDevice::new_authorize_existing_key(fake.clone(), &absent).is_err());
+        assert!(!fake.0.lock().unwrap().connected);
+        assert!(!absent.exists());
     }
 }
 

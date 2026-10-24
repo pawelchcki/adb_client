@@ -22,6 +22,34 @@ pub struct ADBUSBDevice {
 }
 
 impl ADBUSBDevice {
+    /// Explicit enrollment request using an existing key, with no generation.
+    pub fn new_from_transport_authorize_existing_key<P: AsRef<Path>>(
+        transport: USBTransport,
+        private_key_path: P,
+    ) -> Result<Self> {
+        let vendor_id = transport.vendor_id()?;
+        let product_id = transport.product_id()?;
+        Ok(Self {
+            inner: ADBMessageDevice::new_authorize_existing_key(transport, private_key_path)?,
+            vendor_id,
+            product_id,
+        })
+    }
+
+    /// Use only an existing authorized key; never generate a key or request enrollment.
+    pub fn new_from_transport_existing_key<P: AsRef<Path>>(
+        transport: USBTransport,
+        private_key_path: P,
+    ) -> Result<Self> {
+        let vendor_id = transport.vendor_id()?;
+        let product_id = transport.product_id()?;
+        Ok(Self {
+            inner: ADBMessageDevice::new_existing_key(transport, private_key_path)?,
+            vendor_id,
+            product_id,
+        })
+    }
+
     /// Instantiate a new [`ADBUSBDevice`]
     pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
         Self::new_with_custom_private_key(vendor_id, product_id, get_default_adb_key_path()?)
