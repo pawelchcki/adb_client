@@ -32,6 +32,20 @@ pub trait ADBMessageTransport: ADBTransport + Clone + Send + 'static {
         write_timeout: Duration,
     ) -> Result<()>;
 
+    /// Borrow a message so callers can reuse its payload after the write.
+    /// Existing transports remain compatible through the owned fallback.
+    fn write_message_ref_with_timeout(
+        &mut self,
+        message: &ADBTransportMessage,
+        write_timeout: Duration,
+    ) -> Result<()> {
+        self.write_message_with_timeout(message.clone(), write_timeout)
+    }
+
+    fn write_message_ref(&mut self, message: &ADBTransportMessage) -> Result<()> {
+        self.write_message_ref_with_timeout(message, DEFAULT_WRITE_TIMEOUT)
+    }
+
     /// Write data to underlying connection, using default timeout
     fn write_message(&mut self, message: ADBTransportMessage) -> Result<()> {
         self.write_message_with_timeout(message, DEFAULT_WRITE_TIMEOUT)

@@ -13,13 +13,13 @@ pub const AUTH_RSAPUBLICKEY: u32 = 3;
 /// Defaults to 1MB.
 pub const MAX_PAYLOAD_SIZE: u32 = 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ADBTransportMessage {
     header: ADBTransportMessageHeader,
     payload: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ADBTransportMessageHeader {
     command: MessageCommand, /* command identifier constant      */
     arg0: u32,               /* first argument                   */
@@ -70,21 +70,26 @@ impl ADBTransportMessageHeader {
         command_u32 ^ 0xFFFF_FFFF
     }
 
-    pub fn as_bytes(&self) -> Vec<u8> {
-        self.encode()
+    /// Encode the fixed wire header without a heap allocation.
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip([
+            self.command as u32,
+            self.arg0,
+            self.arg1,
+            self.data_length,
+            self.data_crc32,
+            self.magic,
+        ]) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
     }
 }
 
 impl BinaryEncodable for ADBTransportMessageHeader {
     fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.command.encode());
-        bytes.extend_from_slice(&self.arg0.to_le_bytes());
-        bytes.extend_from_slice(&self.arg1.to_le_bytes());
-        bytes.extend_from_slice(&self.data_length.to_le_bytes());
-        bytes.extend_from_slice(&self.data_crc32.to_le_bytes());
-        bytes.extend_from_slice(&self.magic.to_le_bytes());
-        bytes
+        self.to_bytes().to_vec()
     }
 }
 
@@ -169,5 +174,30 @@ impl TryFrom<[u8; 24]> for ADBTransportMessageHeader {
         }
 
         Ok(header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fixed_header_encoding_retains_legacy_wire_format_and_checksum() {
+        let message =
+            ADBTransportMessage::try_new(MessageCommand::Write, 123, 456, b"DATA\x03\0\0\0abc")
+                .unwrap();
+        let bytes = message.header().to_bytes();
+        assert_eq!(&bytes[..4], b"WRTE");
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 11);
+        let decoded = ADBTransportMessageHeader::try_from(bytes).unwrap();
+        let received =
+            ADBTransportMessage::from_header_and_payload(decoded, message.payload().to_vec());
+        assert!(received.check_message_integrity());
+        assert_eq!(message.header().encode(), bytes);
+        let mut damaged = received.into_payload();
+        damaged[8] ^= 1;
+        assert!(
+            !ADBTransportMessage::from_header_and_payload(message.header().clone(), damaged)
+                .check_message_integrity()
+        );
     }
 }

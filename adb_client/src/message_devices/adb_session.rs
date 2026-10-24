@@ -9,7 +9,7 @@ use crate::{
     AdbStatResponse, BinaryDecodable, Result, RustADBError,
     message_devices::{
         adb_message_transport::ADBMessageTransport,
-        adb_transport_message::ADBTransportMessage,
+        adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
         message_commands::{MessageCommand, MessageSubcommand},
         utils::BinaryEncodable,
     },
@@ -151,36 +151,46 @@ impl<T: ADBMessageTransport> ADBSession<T> {
     }
 
     pub(crate) fn push_file<R: std::io::Read>(&mut self, mut reader: R) -> Result<()> {
-        let mut buffer = vec![0; SYNC_DATA_MAX_SIZE].into_boxed_slice();
+        if self.max_payload_size <= SYNC_HEADER_SIZE {
+            return Err(RustADBError::ADBRequestFailed(
+                "Negotiated payload is too small for sync DATA".into(),
+            ));
+        }
+        // Read directly into one coalesced sync payload and reuse its allocation
+        // after each acknowledged write. Preserve the negotiated message limit.
+        let mut payload = vec![0; self.max_payload_size];
         let mut eof = false;
-
         while !eof {
-            // Fill the message with as many sync `DATA` chunks as it can hold
-            let mut payload = Vec::with_capacity(self.max_payload_size);
-            while payload.len() + SYNC_HEADER_SIZE < self.max_payload_size {
-                let chunk_size = (self.max_payload_size - payload.len() - SYNC_HEADER_SIZE)
-                    .min(SYNC_DATA_MAX_SIZE);
-                let size = reader.read(&mut buffer[..chunk_size])?;
+            payload.resize(self.max_payload_size, 0);
+            let mut used = 0;
+            while used + SYNC_HEADER_SIZE < self.max_payload_size {
+                let capacity =
+                    (self.max_payload_size - used - SYNC_HEADER_SIZE).min(SYNC_DATA_MAX_SIZE);
+                let size = reader.read(
+                    &mut payload[used + SYNC_HEADER_SIZE..used + SYNC_HEADER_SIZE + capacity],
+                )?;
                 if size == 0 {
                     eof = true;
                     break;
                 }
-
-                payload.append(
-                    &mut MessageSubcommand::Data
-                        .with_arg(u32::try_from(size)?)
-                        .encode(),
-                );
-                payload.extend_from_slice(&buffer[..size]);
+                payload[used..used + 4].copy_from_slice(b"DATA");
+                payload[used + 4..used + 8].copy_from_slice(&u32::try_from(size)?.to_le_bytes());
+                used += SYNC_HEADER_SIZE + size;
             }
-
-            if !payload.is_empty() {
-                self.send_and_expect_okay(ADBTransportMessage::try_new(
+            if used != 0 {
+                payload.truncate(used);
+                let header = ADBTransportMessageHeader::try_new(
                     MessageCommand::Write,
-                    self.local_id(),
-                    self.remote_id(),
+                    self.local_id,
+                    self.remote_id,
                     &payload,
-                )?)?;
+                )?;
+                let message = ADBTransportMessage::from_header_and_payload(header, payload);
+                self.transport.write_message_ref(&message)?;
+                self.transport
+                    .read_message()?
+                    .assert_command(MessageCommand::Okay)?;
+                payload = message.into_payload();
             }
         }
 
@@ -244,5 +254,137 @@ impl<T: ADBMessageTransport> Drop for ADBSession<T> {
             .transport
             .read_message_with_timeout(Duration::from_millis(20))
         {}
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use crate::adb_transport::ADBTransport;
+    use std::{
+        collections::VecDeque,
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Default)]
+    struct State {
+        replies: VecDeque<ADBTransportMessage>,
+        frames: Vec<(Vec<u8>, usize)>,
+    }
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<State>>);
+    impl ADBTransport for Capture {
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl ADBMessageTransport for Capture {
+        fn read_message_with_timeout(&mut self, _: Duration) -> Result<ADBTransportMessage> {
+            self.0
+                .lock()
+                .unwrap()
+                .replies
+                .pop_front()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof).into())
+        }
+        fn write_message_with_timeout(
+            &mut self,
+            message: ADBTransportMessage,
+            timeout: Duration,
+        ) -> Result<()> {
+            self.write_message_ref_with_timeout(&message, timeout)
+        }
+        fn write_message_ref_with_timeout(
+            &mut self,
+            message: &ADBTransportMessage,
+            _: Duration,
+        ) -> Result<()> {
+            assert!(message.check_message_integrity());
+            assert_eq!(message.header().command(), MessageCommand::Write);
+            let mut state = self.0.lock().unwrap();
+            state.frames.push((
+                message.payload().to_vec(),
+                message.payload().as_ptr() as usize,
+            ));
+            state.replies.push_back(ADBTransportMessage::try_new(
+                MessageCommand::Okay,
+                2,
+                1,
+                &[],
+            )?);
+            if message.payload().starts_with(b"DONE") {
+                state.replies.push_back(ADBTransportMessage::try_new(
+                    MessageCommand::Write,
+                    2,
+                    1,
+                    b"OKAY\0\0\0\0",
+                )?);
+            }
+            Ok(())
+        }
+    }
+    struct ShortRead {
+        bytes: Cursor<Vec<u8>>,
+        chunk: usize,
+    }
+    impl Read for ShortRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = buffer.len().min(self.chunk);
+            self.bytes.read(&mut buffer[..count])
+        }
+    }
+    #[test]
+    fn upload_reuses_coalesced_frames_with_empty_files_short_reads_and_negotiated_limits() {
+        for maximum in [4096, 65544, 1048576] {
+            for size in [0, maximum * 2 + 123] {
+                for chunk in [17, usize::MAX] {
+                    let bytes: Vec<_> = (0..size).map(|n| u8::try_from(n % 251).unwrap()).collect();
+                    let capture = Capture(Arc::default());
+                    let mut session = ADBSession::new(capture.clone(), 1, 2, maximum);
+                    session
+                        .push_file(ShortRead {
+                            bytes: Cursor::new(bytes.clone()),
+                            chunk,
+                        })
+                        .unwrap();
+                    let state = capture.0.lock().unwrap();
+                    let mut received = Vec::new();
+                    let frames = &state.frames[..state.frames.len() - 1];
+                    for (payload, address) in frames {
+                        assert!(!payload.is_empty() && payload.len() <= maximum);
+                        assert_eq!(*address, frames[0].1);
+                        let mut offset = 0;
+                        while offset < payload.len() {
+                            assert_eq!(&payload[offset..offset + 4], b"DATA");
+                            let count = u32::from_le_bytes(
+                                payload[offset + 4..offset + 8].try_into().unwrap(),
+                            ) as usize;
+                            assert!(count != 0 && count <= SYNC_DATA_MAX_SIZE);
+                            received.extend_from_slice(&payload[offset + 8..offset + 8 + count]);
+                            offset += 8 + count;
+                        }
+                    }
+                    assert_eq!(received, bytes);
+                    let done = &state.frames.last().unwrap().0;
+                    assert_eq!(&done[..4], b"DONE");
+                    assert_eq!(done.len(), 8);
+                    assert!(u32::from_le_bytes(done[4..].try_into().unwrap()) > 0);
+                    assert!(state.replies.is_empty());
+                }
+            }
+        }
+    }
+    #[test]
+    fn invalid_negotiated_sync_payload_fails_before_reading_or_writing() {
+        for maximum in 0..=8 {
+            let capture = Capture(Arc::default());
+            let mut session = ADBSession::new(capture.clone(), 1, 2, maximum);
+            assert!(session.push_file(io::empty()).is_err());
+            assert!(capture.0.lock().unwrap().frames.is_empty());
+        }
     }
 }

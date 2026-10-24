@@ -157,23 +157,9 @@ impl USBTransport {
     fn write_bulk_data(&self, data: &[u8], timeout: Duration) -> Result<()> {
         let endpoint = self.get_write_endpoint()?;
         let handle = self.get_raw_connection()?;
-        let max_packet_size = endpoint.max_packet_size;
-
-        let mut offset = 0;
-        let data_len = data.len();
-        while offset < data_len {
-            let write_amount = handle.write_bulk(endpoint.address, &data[offset..], timeout)?;
-            offset += write_amount;
-
-            log::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
-        }
-
-        if offset % max_packet_size == 0 {
-            log::trace!("must send final zero-length packet");
-            handle.write_bulk(endpoint.address, &[], timeout)?;
-        }
-
-        Ok(())
+        write_bulk_all(data, endpoint.max_packet_size, |bytes| {
+            Ok(handle.write_bulk(endpoint.address, bytes, timeout)?)
+        })
     }
 }
 
@@ -227,14 +213,22 @@ impl ADBMessageTransport for USBTransport {
         message: ADBTransportMessage,
         timeout: Duration,
     ) -> Result<()> {
-        let message_bytes = message.header().as_bytes();
+        self.write_message_ref_with_timeout(&message, timeout)
+    }
+
+    fn write_message_ref_with_timeout(
+        &mut self,
+        message: &ADBTransportMessage,
+        timeout: Duration,
+    ) -> Result<()> {
+        let message_bytes = message.header().to_bytes();
         self.write_bulk_data(&message_bytes, timeout)?;
 
         log::trace!("successfully write header: {} bytes", message_bytes.len());
 
-        let payload = message.into_payload();
+        let payload = message.payload();
         if !payload.is_empty() {
-            self.write_bulk_data(&payload, timeout)?;
+            self.write_bulk_data(payload, timeout)?;
             log::trace!("successfully write payload: {} bytes", payload.len());
         }
 
@@ -244,25 +238,19 @@ impl ADBMessageTransport for USBTransport {
     fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
         let endpoint = self.get_read_endpoint()?;
         let handle = self.get_raw_connection()?;
-        let max_packet_size = endpoint.max_packet_size;
-
         let mut data = [0u8; 24];
-        let mut offset = 0;
-        while offset < data.len() {
-            let end = (offset + max_packet_size).min(data.len());
-            let chunk = &mut data[offset..end];
-            offset += handle.read_bulk(endpoint.address, chunk, timeout)?;
-        }
+        read_bulk_exact(&mut data, |bytes| {
+            Ok(handle.read_bulk(endpoint.address, bytes, timeout)?)
+        })?;
 
         let header = ADBTransportMessageHeader::try_from(data)?;
         log::trace!("received header {header:?}");
 
         if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
-            let mut offset = 0;
-            while offset < msg_data.len() {
-                offset += handle.read_bulk(endpoint.address, &mut msg_data[offset..], timeout)?;
-            }
+            read_bulk_exact(&mut msg_data, |bytes| {
+                Ok(handle.read_bulk(endpoint.address, bytes, timeout)?)
+            })?;
 
             let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
 
@@ -278,5 +266,99 @@ impl ADBMessageTransport for USBTransport {
         }
 
         Ok(ADBTransportMessage::from_header_and_payload(header, vec![]))
+    }
+}
+
+// libusb handles endpoint packet splitting. Keep header and payload transfers
+// separate and terminate packet-aligned writes with the ADB-required ZLP.
+fn write_bulk_all(
+    data: &[u8],
+    packet_size: usize,
+    mut write: impl FnMut(&[u8]) -> Result<usize>,
+) -> Result<()> {
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let count = write(remaining)?;
+        if count == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+        }
+        remaining = &remaining[count..];
+    }
+    if data.len().is_multiple_of(packet_size) {
+        write(&[])?;
+    }
+    Ok(())
+}
+fn read_bulk_exact(
+    mut bytes: &mut [u8],
+    mut read: impl FnMut(&mut [u8]) -> Result<usize>,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        // USB ZLPs are legal between ADB messages: consume them and keep reading.
+        let count = read(bytes)?;
+        bytes = &mut bytes[count..];
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bulk_writes_batch_packets_and_preserve_short_tails_and_zlps() {
+        for packet_size in [512, 1024] {
+            for length in [24, 0, packet_size, packet_size * 64, packet_size * 64 + 7] {
+                let data = vec![123; length];
+                let mut written = Vec::new();
+                let mut lengths = Vec::new();
+                write_bulk_all(&data, packet_size, |bytes| {
+                    lengths.push(bytes.len());
+                    written.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                })
+                .unwrap();
+                assert_eq!(written, data);
+                assert_eq!(
+                    lengths,
+                    if length == 0 {
+                        vec![0]
+                    } else if length.is_multiple_of(packet_size) {
+                        vec![length, 0]
+                    } else {
+                        vec![length]
+                    }
+                );
+                let mut short = Vec::new();
+                write_bulk_all(&data, packet_size, |bytes| {
+                    let count = bytes.len().min(13);
+                    short.extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                })
+                .unwrap();
+                assert_eq!(short, data);
+            }
+        }
+        assert!(write_bulk_all(b"x", 512, |_| Ok(0)).is_err());
+    }
+    #[test]
+    fn bulk_reads_accept_partial_transfers_and_interleaved_zlps() {
+        let expected = vec![42; 65543];
+        let mut output = vec![0; expected.len()];
+        let mut offset = 0;
+        let mut calls = 0;
+        read_bulk_exact(&mut output, |bytes| {
+            calls += 1;
+            let count = if calls % 3 == 0 {
+                0
+            } else {
+                bytes.len().min(8192)
+            };
+            bytes[..count].copy_from_slice(&expected[offset..offset + count]);
+            offset += count;
+            Ok(count)
+        })
+        .unwrap();
+        assert_eq!(output, expected);
+        assert!(calls < 16);
     }
 }

@@ -15,7 +15,7 @@ use crate::{
 };
 use std::{
     fs::read_to_string,
-    io::{Read, Write},
+    io::{IoSlice, Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -65,6 +65,13 @@ impl Write for CurrentConnection {
         }
     }
 
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write_vectored(bufs),
+            Self::Tls(stream) => stream.write_vectored(bufs),
+        }
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Tcp(tcp_stream) => tcp_stream.flush(),
@@ -111,6 +118,7 @@ impl TcpTransport {
 impl ADBTransport for TcpTransport {
     fn connect(&mut self) -> Result<()> {
         let stream = TcpStream::connect(self.address)?;
+        stream.set_nodelay(true)?;
         self.current_connection = Some(Arc::new(Mutex::new(CurrentConnection::Tcp(stream))));
         Ok(())
     }
@@ -145,26 +153,13 @@ impl ADBMessageTransport for TcpTransport {
         raw_connection.set_read_timeout(read_timeout)?;
 
         let mut data = [0; 24];
-        let mut total_read = 0;
-        loop {
-            total_read += raw_connection.read(&mut data[total_read..])?;
-            if total_read == data.len() {
-                break;
-            }
-        }
+        raw_connection.read_exact(&mut data)?;
 
         let header = ADBTransportMessageHeader::try_from(data)?;
 
         if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
-            let mut total_read = 0;
-            loop {
-                total_read += raw_connection.read(&mut msg_data[total_read..])?;
-                if total_read == msg_data.len() {
-                    drop(raw_connection);
-                    break;
-                }
-            }
+            raw_connection.read_exact(&mut msg_data)?;
 
             let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
 
@@ -187,33 +182,20 @@ impl ADBMessageTransport for TcpTransport {
         message: ADBTransportMessage,
         write_timeout: Duration,
     ) -> Result<()> {
-        let message_bytes = message.header().as_bytes();
+        self.write_message_ref_with_timeout(&message, write_timeout)
+    }
+
+    fn write_message_ref_with_timeout(
+        &mut self,
+        message: &ADBTransportMessage,
+        write_timeout: Duration,
+    ) -> Result<()> {
+        let header = message.header().to_bytes();
         let raw_connection_lock = self.get_current_connection()?;
-        let mut raw_connection = raw_connection_lock.lock()?;
-        raw_connection.set_write_timeout(write_timeout)?;
-
-        let mut total_written = 0;
-        loop {
-            total_written += raw_connection.write(&message_bytes[total_written..])?;
-            if total_written == message_bytes.len() {
-                raw_connection.flush()?;
-                break;
-            }
-        }
-
-        let payload = message.into_payload();
-        if !payload.is_empty() {
-            let mut total_written = 0;
-            loop {
-                total_written += raw_connection.write(&payload[total_written..])?;
-                if total_written == payload.len() {
-                    raw_connection.flush()?;
-                    drop(raw_connection);
-                    break;
-                }
-            }
-        }
-
+        let mut connection = raw_connection_lock.lock()?;
+        connection.set_write_timeout(write_timeout)?;
+        write_message_parts(&mut *connection, &header, message.payload())?;
+        connection.flush()?;
         Ok(())
     }
 
@@ -266,6 +248,25 @@ impl ADBMessageTransport for TcpTransport {
     }
 }
 
+// Handle partial vectored writes, including a write stopping inside the header.
+fn write_message_parts(
+    writer: &mut impl Write,
+    header: &[u8; 24],
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let mut slices = [IoSlice::new(header), IoSlice::new(payload)];
+    let mut remaining = &mut slices[..];
+    while !remaining.is_empty() {
+        match writer.write_vectored(remaining) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => IoSlice::advance_slices(&mut remaining, count),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct NoCertificateVerification;
 
@@ -315,5 +316,77 @@ impl ServerCertVerifier for NoCertificateVerification {
             SignatureScheme::ED25519,
             SignatureScheme::ED448,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message_devices::message_commands::MessageCommand;
+    #[test]
+    fn truncated_tcp_headers_and_payloads_report_eof() {
+        let header = ADBTransportMessageHeader::try_new(MessageCommand::Write, 1, 2, b"abc")
+            .unwrap()
+            .to_bytes();
+        for bytes in [header[..7].to_vec(), header.to_vec()] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = std::thread::spawn(move || {
+                listener.accept().unwrap().0.write_all(&bytes).unwrap();
+            });
+            let mut transport = TcpTransport::new(address, "unused-test-key");
+            transport.connect().unwrap();
+            let error = transport
+                .read_message_with_timeout(Duration::from_secs(1))
+                .unwrap_err();
+            assert!(
+                matches!(error, RustADBError::IOError(error) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+            );
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn vectored_message_write_handles_partial_headers_payloads_interrupts_and_zero_progress() {
+        struct Short {
+            bytes: Vec<u8>,
+            chunk: usize,
+            interrupt: bool,
+        }
+        impl Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.interrupt {
+                    self.interrupt = false;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = bytes.len().min(self.chunk);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let header = [42; 24];
+        for chunk in [1, 7, 24, 1024] {
+            let mut writer = Short {
+                bytes: vec![],
+                chunk,
+                interrupt: true,
+            };
+            write_message_parts(&mut writer, &header, b"payload").unwrap();
+            assert_eq!(writer.bytes, [header.as_slice(), b"payload"].concat());
+        }
+        let mut writer = Short {
+            bytes: vec![],
+            chunk: 0,
+            interrupt: false,
+        };
+        assert_eq!(
+            write_message_parts(&mut writer, &header, b"payload")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WriteZero
+        );
     }
 }
