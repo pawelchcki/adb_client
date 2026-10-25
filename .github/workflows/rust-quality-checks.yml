@@ -65,6 +65,9 @@ jobs:
           package_name: ${{ inputs.package_name }}
           features: ${{ inputs.features }}
 
+      - name: Test policy helper
+        run: python3 -m unittest discover -s tools -p "*_test.py"
+
   outdated:
     runs-on: ubuntu-latest
     steps:
