@@ -527,3 +527,84 @@ fn shutdown_interrupts_a_blocked_writer_and_dispatcher() {
         .expect("shutdown waited behind the blocked writer")
         .unwrap();
 }
+
+#[test]
+fn reverse_rules_share_targets_until_the_last_rule_is_removed() {
+    let (mut controller, replies, received, disconnected) = fixture();
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = target.local_addr().unwrap();
+    let service = format!("tcp:{}\0", address.port());
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let peer = thread::spawn(move || {
+        let mut controls = std::collections::HashSet::new();
+        while !disconnected.load(Ordering::SeqCst) {
+            let Ok(message) = received.recv_timeout(Duration::from_millis(50)) else {
+                continue;
+            };
+            let local = message.header().arg0();
+            let remote = message.header().arg1();
+            match message.header().command() {
+                Command::Open => {
+                    controls.insert(local);
+                    replies
+                        .send(packet(Command::Okay, 100 + local, local, &[]))
+                        .unwrap();
+                    let response = if message.payload().starts_with(b"reverse:forward:tcp:7002;") {
+                        b"FAILno listener available".as_slice()
+                    } else {
+                        b"OKAY".as_slice()
+                    };
+                    replies
+                        .send(packet(Command::Write, 100 + local, local, response))
+                        .unwrap();
+                }
+                Command::Okay if controls.contains(&local) => {
+                    replies
+                        .send(packet(Command::Clse, remote, local, &[]))
+                        .unwrap();
+                }
+                Command::Okay if remote == 900 || remote == 901 => {
+                    opened_tx.send(remote).unwrap();
+                    replies
+                        .send(packet(Command::Clse, remote, local, &[]))
+                        .unwrap();
+                }
+                Command::Clse if remote == 902 => {
+                    assert_eq!(local, 0);
+                    opened_tx.send(remote).unwrap();
+                }
+                Command::Clse => {}
+                other => panic!("unexpected {other}"),
+            }
+        }
+    });
+    assert_eq!(controller.reverse(7000, address).unwrap(), 7000);
+    let second = controller.reverse(7001, address);
+    if let Err(error) = second {
+        controller.close().unwrap();
+        peer.join().unwrap();
+        panic!("a distinct reverse port could not share its target: {error}");
+    }
+    assert_eq!(second.unwrap(), 7001);
+    assert!(controller.reverse(7002, address).is_err());
+    // Failed additions must not remove an already shared target.
+    controller
+        .hub
+        .route(packet(Command::Open, 900, 0, service.as_bytes()))
+        .unwrap();
+    assert_eq!(opened_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 900);
+    controller.reverse_remove(7000).unwrap();
+    controller
+        .hub
+        .route(packet(Command::Open, 901, 0, service.as_bytes()))
+        .unwrap();
+    assert_eq!(opened_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 901);
+    controller.reverse_remove(7001).unwrap();
+    controller
+        .hub
+        .route(packet(Command::Open, 902, 0, service.as_bytes()))
+        .unwrap();
+    assert_eq!(opened_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 902);
+    controller.close().unwrap();
+    peer.join().unwrap();
+}

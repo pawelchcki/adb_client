@@ -771,10 +771,19 @@ impl ADBForwarder {
         let rule = Arc::new(Rule::default());
         {
             let mut targets = self.hub.targets.lock()?;
-            if targets.contains_key(&target) || self.reverse.contains_key(&remote_port) {
+            if self.reverse.contains_key(&remote_port) {
                 return Err(io::Error::from(io::ErrorKind::AddrInUse).into());
             }
-            targets.insert(target.clone(), (local, rule));
+            match targets.entry(target.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    if entry.get().0 != local {
+                        return Err(io::Error::from(io::ErrorKind::AddrInUse).into());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((local, rule));
+                }
+            }
         }
         let response = self.control(&format!("reverse:forward:tcp:{remote_port};{target}"));
         let port = response.and_then(|bytes| {
@@ -806,9 +815,7 @@ impl ADBForwarder {
                 Ok(port)
             }
             Err(error) => {
-                if let Some((_, rule)) = self.hub.targets.lock()?.remove(&target) {
-                    rule.close();
-                }
+                self.remove_unused_reverse_target(&target)?;
                 Err(error)
             }
         }
@@ -831,16 +838,25 @@ impl ADBForwarder {
         Ok(reply[4..].to_vec())
     }
 
-    /// Remove one device reverse listener and close its active streams.
+    fn remove_unused_reverse_target(&self, target: &str) -> Result<()> {
+        if !self.reverse.values().any(|registered| registered == target) {
+            let removed = self.hub.targets.lock()?.remove(target);
+            if let Some((_, rule)) = removed {
+                rule.close();
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove one device reverse listener. Streams to a shared host target close
+    /// when the last associated reverse listener is removed.
     pub fn reverse_remove(&mut self, remote_port: u16) -> Result<()> {
         if !self.reverse.contains_key(&remote_port) {
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
         }
         self.control(&format!("reverse:killforward:tcp:{remote_port}"))?;
-        if let Some(target) = self.reverse.remove(&remote_port)
-            && let Some((_, rule)) = self.hub.targets.lock()?.remove(&target)
-        {
-            rule.close();
+        if let Some(target) = self.reverse.remove(&remote_port) {
+            self.remove_unused_reverse_target(&target)?;
         }
         Ok(())
     }
