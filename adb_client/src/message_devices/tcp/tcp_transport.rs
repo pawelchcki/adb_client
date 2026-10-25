@@ -105,7 +105,14 @@ impl ADBMessageTransport for TcpTransport {
     }
 
     fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
-        self.get_current_connection()?.read_message(timeout)
+        self.get_current_connection()?.read_message(timeout, None)
+    }
+
+    fn read_message_with_deadline(&mut self, deadline: Instant) -> Result<ADBTransportMessage> {
+        self.get_current_connection()?.read_message(
+            crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT,
+            Some(deadline),
+        )
     }
 
     fn write_message_with_timeout(

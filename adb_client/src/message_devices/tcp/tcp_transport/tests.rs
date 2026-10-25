@@ -299,3 +299,78 @@ fn tls_upgrade_obeys_the_remaining_handshake_deadline_with_trickled_records() {
         matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
     );
 }
+
+#[test]
+fn trickled_adb_handshake_packet_cannot_extend_the_deadline() {
+    let key = key_file();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Cnxn
+        );
+        let reply =
+            ADBTransportMessage::try_new(MessageCommand::Cnxn, 0x0100_0000, 4096, b"device::\0")
+                .unwrap();
+        let mut bytes = reply.header().as_bytes();
+        bytes.extend_from_slice(reply.payload());
+        for byte in bytes {
+            std::thread::sleep(Duration::from_millis(50));
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+        }
+    });
+    let result = crate::tcp::ADBTcpDevice::new_with_custom_private_key_and_timeouts(
+        address,
+        &key.0,
+        crate::ADBTimeouts {
+            handshake: Some(Duration::from_secs(1)),
+            ..crate::ADBTimeouts::default()
+        },
+    );
+    peer.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+}
+
+#[test]
+fn tls_partial_adb_packet_resumes_after_an_idle_timeout() {
+    let (mut transport, peer, _key) = fixture(true, false);
+    let error = transport
+        .read_message_with_timeout(Duration::from_millis(50))
+        .unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+    for tag in b"ab" {
+        transport
+            .write_message_with_timeout(
+                ADBTransportMessage::try_new(MessageCommand::Write, 1, 7, &vec![*tag; 128 * 1024])
+                    .unwrap(),
+                Duration::from_secs(3),
+            )
+            .unwrap();
+    }
+    let resumed = transport.read_message_with_timeout(Duration::from_secs(3));
+    let close = resumed
+        .as_ref()
+        .ok()
+        .map(|_| transport.read_message_with_timeout(Duration::from_secs(3)));
+    let served = peer.join();
+    transport.disconnect().unwrap();
+    let resumed = resumed.expect("TLS state was corrupted by a recoverable timeout");
+    assert_eq!(
+        close.unwrap().unwrap().header().command(),
+        MessageCommand::Clse
+    );
+    served.unwrap();
+    assert_eq!(resumed.payload(), vec![b'r'; 128 * 1024]);
+}

@@ -608,3 +608,57 @@ fn reverse_rules_share_targets_until_the_last_rule_is_removed() {
     controller.close().unwrap();
     peer.join().unwrap();
 }
+
+#[test]
+fn uncertain_reverse_creation_remains_removable() {
+    for lost in [false, true] {
+        let (mut controller, replies, received, disconnected) =
+            fixture_with_timeout(Some(Duration::from_millis(100)));
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = target.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            while !disconnected.load(Ordering::SeqCst) {
+                let Ok(message) = received.recv_timeout(Duration::from_millis(50)) else {
+                    continue;
+                };
+                let local = message.header().arg0();
+                let remote = message.header().arg1();
+                match message.header().command() {
+                    Command::Open => {
+                        replies
+                            .send(packet(Command::Okay, 100 + local, local, &[]))
+                            .unwrap();
+                        let adding = message.payload().starts_with(b"reverse:forward:");
+                        if !adding || !lost {
+                            replies
+                                .send(packet(
+                                    Command::Write,
+                                    100 + local,
+                                    local,
+                                    if adding { b"malformed reply" } else { b"OKAY" },
+                                ))
+                                .unwrap();
+                        }
+                    }
+                    Command::Okay => {
+                        replies
+                            .send(packet(Command::Clse, remote, local, &[]))
+                            .unwrap();
+                    }
+                    Command::Clse => {}
+                    other => panic!("unexpected {other}"),
+                }
+            }
+        });
+        assert!(controller.reverse(7000, address).is_err());
+        assert_eq!(
+            controller.reverse_ports(),
+            [7000],
+            "uncertain device listener became untracked"
+        );
+        controller.reverse_remove(7000).unwrap();
+        assert_eq!(controller.reverse_ports(), [] as [u16; 0]);
+        controller.close().unwrap();
+        peer.join().unwrap();
+    }
+}

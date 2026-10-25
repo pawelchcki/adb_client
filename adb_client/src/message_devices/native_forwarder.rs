@@ -757,6 +757,9 @@ impl ADBForwarder {
     }
 
     /// Ask adbd to listen on a device TCP port and route connections to `local`.
+    /// A failed reply for a fixed port leaves that port in `reverse_ports` so
+    /// `reverse_remove` can clean up an uncertain device listener. A failed
+    /// allocation reply disconnects, since the assigned port is unknown.
     /// Port zero asks adbd for an available port. Only registered local targets
     /// may be opened by the device; arbitrary device-initiated services are refused.
     pub fn reverse(&mut self, remote_port: u16, local: SocketAddr) -> Result<u16> {
@@ -785,43 +788,59 @@ impl ADBForwarder {
                 }
             }
         }
-        let response = self.control(&format!("reverse:forward:tcp:{remote_port};{target}"));
-        let port = response.and_then(|bytes| {
-            if remote_port != 0 {
-                return Ok(remote_port);
-            }
-            if bytes.len() < 4 {
-                return Err(RustADBError::ADBRequestFailed(
-                    "reverse response omitted allocated port".into(),
-                ));
-            }
-            let size = usize::from_str_radix(std::str::from_utf8(&bytes[..4])?, 16)?;
-            let port = bytes
-                .get(4..4 + size)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-            let port: u16 = std::str::from_utf8(port)?.parse()?;
-            if port == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "adbd returned reverse port zero",
-                )
-                .into());
-            }
-            Ok(port)
-        });
+        let response = self.control_reply(&format!("reverse:forward:tcp:{remote_port};{target}"));
+        let rejected = response
+            .as_ref()
+            .is_ok_and(|bytes| bytes.starts_with(b"FAIL"));
+        let port = response
+            .and_then(Self::parse_control_reply)
+            .and_then(|bytes| {
+                if remote_port != 0 {
+                    return Ok(remote_port);
+                }
+                if bytes.len() < 4 {
+                    return Err(RustADBError::ADBRequestFailed(
+                        "reverse response omitted allocated port".into(),
+                    ));
+                }
+                let size = usize::from_str_radix(std::str::from_utf8(&bytes[..4])?, 16)?;
+                let port = bytes
+                    .get(4..4 + size)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+                let port: u16 = std::str::from_utf8(port)?.parse()?;
+                if port == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "adbd returned reverse port zero",
+                    )
+                    .into());
+                }
+                Ok(port)
+            });
         match port {
             Ok(port) => {
                 self.reverse.insert(port, target);
                 Ok(port)
             }
             Err(error) => {
-                self.remove_unused_reverse_target(&target)?;
+                if !rejected && remote_port != 0 {
+                    // adbd may have installed the listener before its reply
+                    // failed. Keep the known port available to reverse_remove.
+                    self.reverse.insert(remote_port, target);
+                } else {
+                    if !rejected {
+                        // An allocated port cannot be recovered from a lost
+                        // reply; disconnect removes all transport-owned rules.
+                        self.hub.stop();
+                    }
+                    self.remove_unused_reverse_target(&target)?;
+                }
                 Err(error)
             }
         }
     }
 
-    fn control(&self, service: &str) -> Result<Vec<u8>> {
+    fn control_reply(&self, service: &str) -> Result<Vec<u8>> {
         let mut reader = self.hub.open(service, &Arc::new(Rule::default()), None)?;
         let mut reply = Vec::new();
         reader.by_ref().take(4097).read_to_end(&mut reply)?;
@@ -830,12 +849,21 @@ impl ADBForwarder {
                 io::Error::new(io::ErrorKind::InvalidData, "oversized reverse response").into(),
             );
         }
+        Ok(reply)
+    }
+
+    fn parse_control_reply(mut reply: Vec<u8>) -> Result<Vec<u8>> {
         if !reply.starts_with(b"OKAY") {
             return Err(RustADBError::ADBRequestFailed(
                 String::from_utf8_lossy(&reply).into_owned(),
             ));
         }
-        Ok(reply[4..].to_vec())
+        drop(reply.drain(..4));
+        Ok(reply)
+    }
+
+    fn control(&self, service: &str) -> Result<Vec<u8>> {
+        Self::parse_control_reply(self.control_reply(service)?)
     }
 
     fn remove_unused_reverse_target(&self, target: &str) -> Result<()> {

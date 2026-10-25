@@ -157,14 +157,12 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         deadline: Option<Instant>,
     ) -> Result<ADBTransportMessage> {
         loop {
-            let timeout = match deadline {
-                Some(deadline) => deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|duration| !duration.is_zero())
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?,
-                None => crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT,
+            let message = match deadline {
+                Some(deadline) => transport.read_message_with_deadline(deadline)?,
+                None => transport.read_message_with_timeout(
+                    crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT,
+                )?,
             };
-            let message = transport.read_message_with_timeout(timeout)?;
 
             match message.header().command() {
                 MessageCommand::Okay | MessageCommand::Write | MessageCommand::Clse => {

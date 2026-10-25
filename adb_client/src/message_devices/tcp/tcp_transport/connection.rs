@@ -81,14 +81,18 @@ impl Connection {
         Ok(())
     }
 
-    pub(super) fn read_message(&self, timeout: Duration) -> Result<ADBTransportMessage> {
+    pub(super) fn read_message(
+        &self,
+        timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<ADBTransportMessage> {
         let mut state = self.receive.lock()?;
-        self.socket
-            .set_read_timeout((timeout != DEFAULT_READ_TIMEOUT).then_some(timeout))?;
         let ReceiveState { tls_input, packet } = &mut *state;
         let mut reader = ConnectionReader {
             connection: self,
             pending: tls_input,
+            timeout: (timeout != DEFAULT_READ_TIMEOUT).then_some(timeout),
+            deadline,
         };
         packet.read(|bytes| reader.read(bytes).map_err(Into::into))
     }
@@ -116,6 +120,22 @@ impl Connection {
 struct ConnectionReader<'a> {
     connection: &'a Connection,
     pending: &'a mut ReceiveBuffer,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+}
+impl ConnectionReader<'_> {
+    fn read_socket(&self, output: &mut [u8]) -> io::Result<usize> {
+        let timeout = match self.deadline {
+            Some(deadline) => Some(
+                crate::message_devices::adb_message_transport::remaining_handshake_timeout(
+                    deadline,
+                )?,
+            ),
+            None => self.timeout,
+        };
+        self.connection.socket.set_read_timeout(timeout)?;
+        (&self.connection.socket).read(output)
+    }
 }
 
 impl Read for ConnectionReader<'_> {
@@ -131,7 +151,7 @@ impl Read for ConnectionReader<'_> {
                 .map_err(|_| io::Error::other("TLS state mutex was poisoned"))?;
             let Some(tls) = state.as_mut() else {
                 drop(state);
-                return (&self.connection.socket).read(output);
+                return self.read_socket(output);
             };
             match tls.reader().read(output) {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
@@ -153,8 +173,25 @@ impl Read for ConnectionReader<'_> {
             // TLS is already handshaken. Any post-handshake response is queued
             // for the next writer; receiving never waits for the send lock.
             drop(state);
+            let timeout = match self.deadline {
+                Some(deadline) => Some(
+                    crate::message_devices::adb_message_transport::remaining_handshake_timeout(
+                        deadline,
+                    )?,
+                ),
+                None => self.timeout,
+            };
+            self.connection.socket.set_read_timeout(timeout)?;
             self.pending.encrypted.resize(16 * 1024, 0);
-            let size = (&self.connection.socket).read(&mut self.pending.encrypted)?;
+            let size = match (&self.connection.socket).read(&mut self.pending.encrypted) {
+                Ok(size) => size,
+                Err(error) => {
+                    // The resized region is scratch space, never TLS input.
+                    self.pending.encrypted.clear();
+                    self.pending.consumed = 0;
+                    return Err(error);
+                }
+            };
             if size == 0 {
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }

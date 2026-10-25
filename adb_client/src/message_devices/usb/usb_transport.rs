@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
@@ -280,13 +280,13 @@ impl ADBMessageTransport for USBTransport {
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected))?
             .lock()?;
         let message_bytes = message.header().as_bytes();
-        self.write_bulk_data(&message_bytes, timeout)?;
+        self.write_bulk_data(&message_bytes, bulk_timeout(timeout))?;
 
         log::trace!("successfully write header: {} bytes", message_bytes.len());
 
         let payload = message.into_payload();
         if !payload.is_empty() {
-            self.write_bulk_data(&payload, timeout)?;
+            self.write_bulk_data(&payload, bulk_timeout(timeout))?;
             log::trace!("successfully write payload: {} bytes", payload.len());
         }
 
@@ -294,25 +294,69 @@ impl ADBMessageTransport for USBTransport {
     }
 
     fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
+        self.read_packet(timeout, None)
+    }
+
+    fn read_message_with_deadline(&mut self, deadline: Instant) -> Result<ADBTransportMessage> {
+        self.read_packet(Duration::ZERO, Some(deadline))
+    }
+}
+
+impl USBTransport {
+    fn read_packet(
+        &mut self,
+        timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<ADBTransportMessage> {
         let endpoint = self.get_read_endpoint()?;
         let handle = self.get_raw_connection()?;
-        let timeout =
-            if timeout == crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT {
-                Duration::ZERO
-            } else {
-                timeout
-            };
         self.receive
             .as_ref()
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected))?
             .lock()?
             .read(|bytes| {
                 loop {
-                    let size = handle.read_bulk(endpoint.address, bytes, timeout)?;
+                    let remaining = match deadline {
+                        Some(deadline) => crate::message_devices::adb_message_transport::remaining_handshake_timeout(deadline)?,
+                        None if timeout == crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT => Duration::ZERO,
+                        None => timeout,
+                    };
+                    let size = handle.read_bulk(endpoint.address, bytes, bulk_timeout(remaining))?;
                     if size != 0 {
                         return Ok(size);
                     }
                 }
             })
+    }
+}
+
+// rusb converts to u32 milliseconds: a sub-millisecond finite budget would
+// otherwise become libusb's zero (infinite), and oversized values would wrap.
+fn bulk_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::ZERO
+    } else {
+        timeout.clamp(
+            Duration::from_millis(1),
+            Duration::from_millis(u64::from(u32::MAX)),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn finite_usb_timeouts_never_become_infinite_or_wrap() {
+        assert_eq!(bulk_timeout(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            bulk_timeout(Duration::from_nanos(1)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(bulk_timeout(Duration::from_secs(2)), Duration::from_secs(2));
+        assert_eq!(
+            bulk_timeout(Duration::MAX),
+            Duration::from_millis(u64::from(u32::MAX))
+        );
     }
 }
