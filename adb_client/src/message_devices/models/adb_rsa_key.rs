@@ -68,7 +68,7 @@ impl ADBRsaKey {
         })
     }
 
-    #[cfg(feature = "webusb")]
+    #[cfg(any(feature = "webusb", test))]
     pub(crate) fn to_pkcs8_pem(&self) -> Result<String> {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
         self.private_key

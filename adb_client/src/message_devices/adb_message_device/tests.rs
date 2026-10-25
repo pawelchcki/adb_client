@@ -352,3 +352,94 @@ fn stat_paths_reach_the_shell_as_one_literal_operand() {
         assert_eq!(output.stdout, expected, "{path}");
     }
 }
+
+fn auth_transport() -> (FakeTransport, mpsc::Sender<ADBTransportMessage>) {
+    let (replies, incoming) = mpsc::channel();
+    let transport = FakeTransport {
+        incoming: Arc::new(Mutex::new(incoming)),
+        replies: replies.clone(),
+        sent: Arc::default(),
+        shell_output: None,
+        on_open: None,
+    };
+    (transport, replies)
+}
+
+fn key_file() -> (std::path::PathBuf, ADBRsaKey) {
+    let key = ADBRsaKey::new_random().unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "adb_client-auth-{}-{}",
+        std::process::id(),
+        rand::rng().random::<u64>()
+    ));
+    std::fs::write(&path, key.to_pkcs8_pem().unwrap()).unwrap();
+    (path, key)
+}
+
+#[test]
+fn existing_key_only_never_offers_the_public_key() {
+    let (path, _) = key_file();
+    let (transport, replies) = auth_transport();
+    let sent = transport.sent.clone();
+    // The device asks to authenticate, then rejects the signature with a new token.
+    replies
+        .send(packet(MessageCommand::Auth, AUTH_TOKEN, 0, &[7; 20]))
+        .unwrap();
+    replies
+        .send(packet(MessageCommand::Auth, AUTH_TOKEN, 0, &[8; 20]))
+        .unwrap();
+    let result =
+        ADBMessageDevice::new_with_auth_policy(transport, &path, AuthPolicy::ExistingKeyOnly);
+    assert!(result.is_err());
+    let sent = sent.lock().unwrap();
+    assert!(sent.iter().any(
+        |m| m.header().command() == MessageCommand::Auth && m.header().arg0() == AUTH_SIGNATURE
+    ));
+    assert!(
+        !sent
+            .iter()
+            .any(|m| m.header().command() == MessageCommand::Auth
+                && m.header().arg0() == AUTH_RSAPUBLICKEY)
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn existing_key_only_requires_a_key_file() {
+    let (transport, _replies) = auth_transport();
+    let missing = std::env::temp_dir().join("adb_client-auth-missing-key");
+    assert!(
+        ADBMessageDevice::new_with_auth_policy(transport, missing, AuthPolicy::ExistingKeyOnly)
+            .is_err()
+    );
+}
+
+#[test]
+fn offer_public_key_still_requests_authorization() {
+    let (path, _) = key_file();
+    let (transport, replies) = auth_transport();
+    let sent = transport.sent.clone();
+    replies
+        .send(packet(MessageCommand::Auth, AUTH_TOKEN, 0, &[7; 20]))
+        .unwrap();
+    replies
+        .send(packet(MessageCommand::Auth, AUTH_TOKEN, 0, &[8; 20]))
+        .unwrap();
+    replies
+        .send(packet(
+            MessageCommand::Cnxn,
+            0x0100_0000,
+            4096,
+            b"device::\0",
+        ))
+        .unwrap();
+    ADBMessageDevice::new_with_auth_policy(transport, &path, AuthPolicy::OfferPublicKey).unwrap();
+    assert!(
+        sent.lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.header().command() == MessageCommand::Auth
+                && m.header().arg0() == AUTH_RSAPUBLICKEY)
+    );
+    let _ = std::fs::remove_file(path);
+}
