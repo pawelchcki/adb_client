@@ -150,7 +150,7 @@ forwarding.close()?;
 `tcp:8001` or `localabstract:my_service`. Reverse rules listen on device TCP ports
 and connect only to explicitly registered host TCP targets. Port zero selects an
 available listening port. Individual removal and remove-all operations are
-available; `close()` removes reverse rules before disconnecting. Dropping the
+available; disconnecting removes transport-owned reverse rules in adbd. Dropping the
 controller stops host listeners and closes active host sockets.
 
 The native devices also offer consuming `forward` and `reverse` convenience

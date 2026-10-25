@@ -10,7 +10,7 @@ use crate::{
     adb_transport::ADBTransport,
     message_devices::{
         adb_message_transport::ADBMessageTransport, adb_transport_message::ADBTransportMessage,
-        message_commands::MessageCommand, packet_reader::PacketReader,
+        packet_reader::PacketReader,
     },
 };
 
@@ -230,11 +230,8 @@ impl ADBTransport for USBTransport {
             return Ok(());
         }
 
-        let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])?;
-        if let Err(e) = self.write_message(message) {
-            log::error!("error while sending CLSE message: {e}");
-        }
-
+        // Release without taking the packet-send mutex: disconnect must also
+        // interrupt a transfer configured with an unlimited write timeout.
         if let Some(handle) = &self.handle {
             let endpoint = self.read_endpoint.as_ref().or(self.write_endpoint.as_ref());
             if let Some(endpoint) = &endpoint {

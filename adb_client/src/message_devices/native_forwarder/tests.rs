@@ -439,3 +439,91 @@ fn data_sent_before_open_acknowledgment_is_preserved() {
     replies.send(packet(Command::Okay, 42, local, &[])).unwrap();
     controller.close().unwrap();
 }
+
+#[derive(Clone)]
+struct BlockedTransport {
+    inner: FakeTransport,
+    blocked: Arc<(Mutex<bool>, Condvar)>,
+    entered: mpsc::Sender<()>,
+}
+impl ADBTransport for BlockedTransport {
+    fn connect(&mut self) -> Result<()> {
+        self.inner.connect()
+    }
+    fn disconnect(&mut self) -> Result<()> {
+        let (blocked, changed) = &*self.blocked;
+        *blocked.lock().unwrap() = false;
+        changed.notify_all();
+        ADBTransport::disconnect(&mut self.inner)
+    }
+}
+impl ADBMessageTransport for BlockedTransport {
+    fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<Message> {
+        self.inner.read_message_with_timeout(timeout)
+    }
+    fn write_message_with_timeout(&mut self, message: Message, timeout: Duration) -> Result<()> {
+        if message.header().command() == Command::Write {
+            self.entered.send(()).unwrap();
+            let (blocked, changed) = &*self.blocked;
+            let mut blocked = blocked.lock().unwrap();
+            while *blocked {
+                blocked = changed.wait(blocked).unwrap();
+            }
+            return Err(broken().into());
+        }
+        self.inner.write_message_with_timeout(message, timeout)
+    }
+}
+
+#[test]
+fn shutdown_interrupts_a_blocked_writer_and_dispatcher() {
+    let (replies, incoming) = mpsc::channel();
+    let (outgoing, received) = mpsc::channel();
+    let (entered, writing) = mpsc::channel();
+    let transport = BlockedTransport {
+        inner: FakeTransport {
+            incoming: Arc::new(Mutex::new(incoming)),
+            replies: replies.clone(),
+            outgoing,
+            disconnected: Arc::new(AtomicBool::new(false)),
+        },
+        blocked: Arc::new((Mutex::new(true), Condvar::new())),
+        entered,
+    };
+    let mut emergency = transport.clone();
+    let mut controller = ADBForwarder::new(
+        ConnectionOwner(transport.inner.clone()),
+        transport,
+        4096,
+        ADBTimeouts {
+            write: None,
+            ..ADBTimeouts::default()
+        },
+    );
+    let address = controller
+        .forward("127.0.0.1:0".parse().unwrap(), "tcp:7000")
+        .unwrap();
+    let mut socket = TcpStream::connect(address).unwrap();
+    let opened = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    replies
+        .send(packet(Command::Okay, 42, opened.header().arg0(), &[]))
+        .unwrap();
+    socket.write_all(b"blocked write").unwrap();
+    writing.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The dispatcher tries to reject this unregistered incoming service while
+    // the first worker owns the writer mutex indefinitely.
+    replies
+        .send(packet(Command::Open, 999, 0, b"tcp:1\0"))
+        .unwrap();
+    let (done, result) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        done.send(controller.close()).unwrap();
+    });
+    let closed = result.recv_timeout(Duration::from_secs(2));
+    // Also unblock the original implementation so a failed regression can end.
+    ADBTransport::disconnect(&mut emergency).unwrap();
+    worker.join().unwrap();
+    closed
+        .expect("shutdown waited behind the blocked writer")
+        .unwrap();
+}

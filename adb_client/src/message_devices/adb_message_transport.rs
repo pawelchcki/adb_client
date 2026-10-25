@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     Result, adb_transport::ADBTransport,
@@ -15,6 +15,12 @@ pub trait ADBMessageTransport: ADBTransport + Clone + Send + 'static {
     fn upgrade_connection(&mut self) -> Result<()> {
         log::trace!("not upgrade needed for this transport");
         Ok(())
+    }
+
+    /// Upgrade within the remaining connection-handshake deadline.
+    /// Custom transports retain their existing upgrade implementation by default.
+    fn upgrade_connection_with_deadline(&mut self, _deadline: Option<Instant>) -> Result<()> {
+        self.upgrade_connection()
     }
 
     /// Read a message using given timeout on the underlying transport

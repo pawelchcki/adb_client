@@ -232,3 +232,70 @@ fn native_handshake_timeout_does_not_wait_for_the_default_read_timeout() {
 fn tls_accepts_a_legacy_adb_pkcs1_identity_without_rewriting_it() {
     exercise_duplex(true, true);
 }
+
+#[test]
+fn tls_upgrade_obeys_the_remaining_handshake_deadline_with_trickled_records() {
+    let key = key_file();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (started, observed) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Cnxn
+        );
+        started.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        stream
+            .write_all(
+                &ADBTransportMessage::try_new(MessageCommand::Stls, 1, 0, &[])
+                    .unwrap()
+                    .header()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Stls
+        );
+        // An incomplete TLS record makes rustls continue reading without
+        // generating a protocol error or extending the overall deadline.
+        let _ = stream.write_all(&[0x16, 0x03, 0x03, 0x00, 100]);
+        while wait.recv_timeout(Duration::from_millis(50)).is_err() {
+            if stream.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+    });
+    let (done, result) = mpsc::channel();
+    let client = std::thread::spawn(move || {
+        done.send(
+            crate::tcp::ADBTcpDevice::new_with_custom_private_key_and_timeouts(
+                address,
+                &key.0,
+                crate::ADBTimeouts {
+                    handshake: Some(Duration::from_secs(1)),
+                    ..crate::ADBTimeouts::default()
+                },
+            )
+            .map(|_| ()),
+        )
+        .unwrap();
+    });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let completed = result.recv_timeout(Duration::from_millis(1300));
+    let _ = release.send(());
+    peer.join().unwrap();
+    client.join().unwrap();
+    let error = completed
+        .expect("TLS upgrade exceeded the total handshake deadline")
+        .unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+}

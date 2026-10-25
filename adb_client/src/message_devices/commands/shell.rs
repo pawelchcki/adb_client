@@ -20,14 +20,27 @@ use crate::{
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     pub(crate) fn exec_out(&mut self, command: &str, output: &mut dyn Write) -> Result<()> {
         let mut session = self.open_session(&ADBLocalCommand::Exec(command.to_owned()))?;
-        loop {
-            let message = session.recv_and_reply_okay()?;
-            match message.header().command() {
-                MessageCommand::Write => output.write_all(message.payload())?,
-                MessageCommand::Clse => return Ok(()),
-                _ => {}
+        let result: Result<()> = (|| {
+            loop {
+                let message = session.recv_and_reply_okay()?;
+                match message.header().command() {
+                    MessageCommand::Write => output.write_all(message.payload())?,
+                    MessageCommand::Clse => return Ok(()),
+                    _ => {}
+                }
             }
-        }
+        })();
+        // Also acknowledge a normal remote close. On failure, release the
+        // remote service while retaining the original output/read error.
+        let close = ADBTransportMessage::try_new(
+            MessageCommand::Clse,
+            session.local_id(),
+            session.remote_id(),
+            &[],
+        )
+        .and_then(|message| session.get_transport_mut().write_message(message));
+        result?;
+        close
     }
 
     /// Runs 'command' in a shell on the device, and write its output and error streams into output.

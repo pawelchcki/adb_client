@@ -98,20 +98,19 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             format!("host::{}\0", env!("CARGO_PKG_NAME")).as_bytes(),
         )?;
 
-        transport.write_message(message)?;
+        Self::write_handshake_message(transport, message, deadline)?;
 
         let message = Self::read_handshake_message(transport, deadline)?;
 
         // Check if a client is requesting a secure connection and upgrade it if necessary
         match message.header().command() {
             MessageCommand::Stls => {
-                transport.write_message(ADBTransportMessage::try_new(
-                    MessageCommand::Stls,
-                    1,
-                    0,
-                    &[],
-                )?)?;
-                transport.upgrade_connection()?;
+                Self::write_handshake_message(
+                    transport,
+                    ADBTransportMessage::try_new(MessageCommand::Stls, 1, 0, &[])?,
+                    deadline,
+                )?;
+                transport.upgrade_connection_with_deadline(deadline)?;
                 log::debug!("Connection successfully upgraded from TCP to TLS");
 
                 let message = Self::read_handshake_message(transport, deadline)?;
@@ -129,6 +128,23 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 message.header().command().to_string(),
                 "CNXN, STLS or AUTH".to_string(),
             )),
+        }
+    }
+
+    fn write_handshake_message(
+        transport: &mut T,
+        message: ADBTransportMessage,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        match deadline {
+            Some(deadline) => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+                transport.write_message_with_timeout(message, remaining)
+            }
+            None => transport.write_message(message),
         }
     }
 
@@ -183,7 +199,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         let message = ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign)?;
 
-        transport.write_message(message)?;
+        Self::write_handshake_message(transport, message, deadline)?;
 
         let received_response = Self::read_handshake_message(transport, deadline)?;
 
@@ -198,7 +214,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let message =
             ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_RSAPUBLICKEY, 0, &pubkey)?;
 
-        transport.write_message(message)?;
+        Self::write_handshake_message(transport, message, deadline)?;
 
         let response = Self::read_handshake_message(transport, deadline)?;
 

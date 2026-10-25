@@ -16,7 +16,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod connection;
@@ -118,6 +118,14 @@ impl ADBMessageTransport for TcpTransport {
     }
 
     fn upgrade_connection(&mut self) -> Result<()> {
+        self.upgrade_connection_with_deadline(
+            self.timeouts
+                .handshake
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+        )
+    }
+
+    fn upgrade_connection_with_deadline(&mut self, deadline: Option<Instant>) -> Result<()> {
         let Some(connection) = self.current_connection.clone() else {
             return Err(RustADBError::UpgradeError(
                 "cannot upgrade a non-existing connection".into(),
@@ -145,7 +153,7 @@ impl ADBMessageTransport for TcpTransport {
             .with_client_auth_cert(certificate, private_key.into())?;
         config.key_log = Arc::new(KeyLogFile::new());
         let client = ClientConnection::new(Arc::new(config), self.address.ip().into())?;
-        connection.upgrade(client)
+        connection.upgrade(client, deadline)
     }
 }
 

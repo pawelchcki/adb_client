@@ -2,7 +2,7 @@ use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustls::ClientConnection;
@@ -51,7 +51,11 @@ impl Connection {
         Ok(self.tls.lock()?.is_some())
     }
 
-    pub(super) fn upgrade(&self, mut client: ClientConnection) -> Result<()> {
+    pub(super) fn upgrade(
+        &self,
+        mut client: ClientConnection,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         // An upgrade owns both directions until the handshake is complete.
         let _receive = self.receive.lock()?;
         let _send = self.send.lock()?;
@@ -61,7 +65,10 @@ impl Connection {
                 "cannot upgrade a TLS connection".into(),
             ));
         }
-        client.complete_io(&mut &self.socket)?;
+        client.complete_io(&mut HandshakeIo {
+            socket: &self.socket,
+            deadline,
+        })?;
         *tls = Some(Box::new(client));
         Ok(())
     }
@@ -202,5 +209,40 @@ impl Write for ConnectionWriter<'_> {
             drop(state);
         }
         (&self.connection.socket).flush()
+    }
+}
+
+// rustls can perform many reads/writes inside complete_io. Recompute the
+// remaining budget at every syscall so partial TLS records cannot extend it.
+struct HandshakeIo<'a> {
+    socket: &'a TcpStream,
+    deadline: Option<Instant>,
+}
+impl HandshakeIo<'_> {
+    fn remaining(&self) -> io::Result<Option<Duration>> {
+        self.deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+            })
+            .transpose()
+    }
+}
+impl Read for HandshakeIo<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.socket.set_read_timeout(self.remaining()?)?;
+        self.socket.read(bytes)
+    }
+}
+impl Write for HandshakeIo<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.socket.set_write_timeout(self.remaining()?)?;
+        self.socket.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.remaining()?;
+        self.socket.flush()
     }
 }

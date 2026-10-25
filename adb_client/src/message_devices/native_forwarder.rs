@@ -20,19 +20,16 @@ use std::{
 
 trait Writer: Send {
     fn send(&mut self, message: Message) -> Result<()>;
-    fn disconnect(&mut self) -> Result<()>;
 }
 impl<T: ADBMessageTransport> Writer for T {
     fn send(&mut self, message: Message) -> Result<()> {
         self.write_message(message)
     }
-    fn disconnect(&mut self) -> Result<()> {
-        ADBTransport::disconnect(self)
-    }
 }
 
 struct Hub {
     writer: Mutex<Box<dyn Writer>>,
+    disconnect: Mutex<Box<dyn ADBTransport + Send>>,
     streams: Mutex<HashMap<u32, Arc<StreamState>>>,
     targets: Mutex<HashMap<String, (SocketAddr, Arc<Rule>)>>,
     next: AtomicU32,
@@ -533,8 +530,10 @@ impl Hub {
                 state.finish(false, true);
             }
         }
-        if let Ok(mut writer) = self.writer.try_lock() {
-            let _ = writer.disconnect();
+        // A transport clone shares the connection but not the send mutex.
+        // Interrupt blocked I/O before waiting for any dispatcher or worker.
+        if let Ok(mut transport) = self.disconnect.lock() {
+            let _ = transport.disconnect();
         }
     }
 }
@@ -626,6 +625,7 @@ impl ADBForwarder {
     ) -> Self {
         let hub = Arc::new(Hub {
             writer: Mutex::new(Box::new(transport.clone())),
+            disconnect: Mutex::new(Box::new(transport.clone())),
             streams: Mutex::default(),
             targets: Mutex::default(),
             next: AtomicU32::new(1),
@@ -853,21 +853,24 @@ impl ADBForwarder {
     }
     /// Stop listeners and streams, disconnect, and wait for the packet dispatcher.
     pub fn close(mut self) -> Result<()> {
-        self.forward_remove_all();
-        let reverse_result = self.reverse_remove_all();
+        // adbd registers reverse listeners against this transport and removes
+        // them on disconnect. Sending control requests here could block behind
+        // the very writer that shutdown must interrupt.
         self.hub.stop();
+        self.forward_remove_all();
+        self.reverse.clear();
         if let Some(reader) = self.reader.take() {
             reader
                 .join()
                 .map_err(|_| io::Error::other("ADB dispatcher panicked"))?;
         }
-        reverse_result
+        Ok(())
     }
 }
 impl Drop for ADBForwarder {
     fn drop(&mut self) {
-        self.forward_remove_all();
         self.hub.stop();
+        self.forward_remove_all();
     }
 }
 

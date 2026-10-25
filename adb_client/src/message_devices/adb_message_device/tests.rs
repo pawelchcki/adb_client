@@ -291,10 +291,9 @@ fn raw_exec_and_screenshot_preserve_binary_output_without_early_close() {
         assert_eq!(output, bytes);
         let sent = device.transport.sent.lock().unwrap();
         assert!(sent[0].payload().starts_with(b"exec:"));
-        assert!(
-            !sent
-                .iter()
-                .any(|message| message.header().command() == MessageCommand::Clse)
+        assert_eq!(
+            sent.last().unwrap().header().command(),
+            MessageCommand::Clse
         );
     }
 }
@@ -406,4 +405,27 @@ fn stat_paths_reach_the_shell_as_one_literal_operand() {
         expected.push(0);
         assert_eq!(output.stdout, expected, "{path}");
     }
+}
+
+#[test]
+fn exec_output_error_closes_its_stream_and_preserves_the_original_error() {
+    struct Full;
+    impl std::io::Write for Full {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(Error::other("output disk is full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut device = device(Some(b"output"));
+    let error = device.exec_out("screencap -p", &mut Full).unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if error.to_string() == "output disk is full")
+    );
+    let sent = device.transport.sent.lock().unwrap();
+    let close = sent.last().unwrap();
+    assert_eq!(close.header().command(), MessageCommand::Clse);
+    assert_eq!(close.header().arg0(), sent[0].header().arg0());
+    assert_eq!(close.header().arg1(), 7);
 }
