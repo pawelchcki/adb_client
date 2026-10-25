@@ -1,0 +1,73 @@
+{
+  "repository": "pawelchcki/adb_client",
+  "repository_id": 1182595109,
+  "settings": {
+    "allow_squash_merge": true,
+    "allow_merge_commit": false,
+    "allow_rebase_merge": false,
+    "allow_auto_merge": false,
+    "delete_branch_on_merge": true,
+    "squash_merge_commit_title": "PR_TITLE",
+    "squash_merge_commit_message": "PR_BODY"
+  },
+  "ruleset": {
+    "name": "protect-default-branch",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "include": [
+          "~DEFAULT_BRANCH"
+        ],
+        "exclude": []
+      }
+    },
+    "bypass_actors": [],
+    "rules": [
+      {
+        "type": "deletion"
+      },
+      {
+        "type": "non_fast_forward"
+      },
+      {
+        "type": "pull_request",
+        "parameters": {
+          "required_approving_review_count": 0,
+          "dismiss_stale_reviews_on_push": false,
+          "require_code_owner_review": false,
+          "require_last_push_approval": false,
+          "required_review_thread_resolution": true,
+          "allowed_merge_methods": [
+            "squash"
+          ]
+        }
+      },
+      {
+        "type": "required_status_checks",
+        "parameters": {
+          "strict_required_status_checks_policy": false,
+          "do_not_enforce_on_create": true,
+          "required_status_checks": [
+            {
+              "context": "codex/review-gate",
+              "integration_id": 4602759
+            },
+            {
+              "context": "ci-toolkit/pull-request-title",
+              "integration_id": 4602759
+            }
+          ]
+        }
+      },
+      {
+        "type": "required_linear_history"
+      }
+    ]
+  },
+  "runnerless": {
+    "review_gate": true,
+    "auto_review": false,
+    "admin_bypass": false
+  }
+}
