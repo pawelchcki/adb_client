@@ -20,6 +20,32 @@ impl PyADBUSBDevice {
         Ok(ADBUSBDevice::autodetect()?.into())
     }
 
+    #[staticmethod]
+    /// Autodetect a device reachable over USB using a custom private key.
+    /// This method raises an error if multiple devices or none are connected.
+    pub fn autodetect_with_custom_private_key(private_key_path: PathBuf) -> Result<Self> {
+        Ok(ADBUSBDevice::autodetect_with_custom_private_key(private_key_path)?.into())
+    }
+
+    #[staticmethod]
+    /// Create a new USB device connection with the given vendor and product IDs.
+    pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
+        Ok(ADBUSBDevice::new(vendor_id, product_id)?.into())
+    }
+
+    #[staticmethod]
+    /// Create a new USB device connection with the given vendor and product IDs, using a custom private key.
+    pub fn new_with_custom_private_key(
+        vendor_id: u16,
+        product_id: u16,
+        private_key_path: PathBuf,
+    ) -> Result<Self> {
+        Ok(
+            ADBUSBDevice::new_with_custom_private_key(vendor_id, product_id, private_key_path)?
+                .into(),
+        )
+    }
+
     /// Run shell commands on device and return the output (stdout + stderr merged)
     pub fn shell_command(&mut self, command: &str) -> Result<Vec<u8>> {
         let mut output = Vec::new();
