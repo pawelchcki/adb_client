@@ -47,6 +47,7 @@ struct Flow {
     remote: u32,
     credit: bool,
     closed: bool,
+    opening: Option<Arc<mio::Waker>>,
 }
 struct StreamState {
     local: u32,
@@ -114,6 +115,9 @@ impl StreamState {
             let was_closed = flow.closed;
             flow.closed = true;
             self.changed.notify_all();
+            if let Some(waker) = &flow.opening {
+                let _ = waker.wake();
+            }
             if was_closed { None } else { Some(flow.remote) }
         } else {
             None
@@ -288,6 +292,7 @@ impl Hub {
                 remote,
                 credit: remote != 0,
                 closed: false,
+                opening: None,
             }),
             changed: Condvar::new(),
             incoming: Mutex::new(Some(send)),
@@ -335,6 +340,73 @@ impl Hub {
         Ok(())
     }
 
+    fn start_forward_open(
+        &self,
+        service: &str,
+        stream: &StreamReader,
+        socket: &TcpStream,
+    ) -> Result<()> {
+        // Wait for either adbd or TCP closure without periodic socket polling.
+        // Readiness monitoring leaves pre-OPEN client bytes in the socket buffer.
+        socket.set_nonblocking(true)?;
+        let result = (|| -> Result<()> {
+            let mut poll = mio::Poll::new()?;
+            let mut source = mio::net::TcpStream::from_std(socket.try_clone()?);
+            poll.registry()
+                .register(&mut source, mio::Token(0), mio::Interest::READABLE)?;
+            let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1))?);
+            stream.state.flow.lock()?.opening = Some(waker);
+            let mut name = service.as_bytes().to_vec();
+            name.push(0);
+            self.send(Command::Open, stream.state.local, 0, &name)?;
+            let deadline = self
+                .timeout
+                .and_then(|timeout| Instant::now().checked_add(timeout));
+            let mut events = mio::Events::with_capacity(4);
+            loop {
+                {
+                    let flow = stream.state.flow.lock()?;
+                    if flow.closed {
+                        return Err(broken().into());
+                    }
+                    if flow.remote != 0 {
+                        return Ok(());
+                    }
+                }
+                let timeout = deadline
+                    .map(|deadline| {
+                        deadline
+                            .checked_duration_since(Instant::now())
+                            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+                    })
+                    .transpose()?;
+                match poll.poll(&mut events, timeout) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                }
+                for event in &events {
+                    if event.token() != mio::Token(0) {
+                        continue;
+                    }
+                    if event.is_read_closed() || event.is_write_closed() || event.is_error() {
+                        return Err(broken().into());
+                    }
+                    if event.is_readable() {
+                        match source.peek(&mut [0]) {
+                            Ok(0) => return Err(broken().into()),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(error) => return Err(error.into()),
+                            Ok(_) => {}
+                        }
+                    }
+                }
+            }
+        })();
+        stream.state.flow.lock()?.opening = None;
+        socket.set_nonblocking(false)?;
+        result
+    }
+
     fn route(self: &Arc<Self>, message: Message) -> Result<()> {
         if message.header().command() == Command::Open {
             self.incoming_open(&message);
@@ -373,6 +445,9 @@ impl Hub {
                 flow.remote = remote;
                 flow.credit = true;
                 state.changed.notify_all();
+                if let Some(waker) = &flow.opening {
+                    let _ = waker.wake();
+                }
             }
             Command::Write if flow.remote != 0 && flow.remote == remote => {
                 let sent = state
@@ -630,9 +705,11 @@ impl ADBForwarder {
                     let reader = hub.reserve(0, &active, Some(socket.try_clone()?))?;
                     let hub = hub.clone();
                     let remote = remote.clone();
-                    thread::spawn(move || match hub.start_open(&remote, &reader) {
-                        Ok(()) => proxy(socket, reader, hub.max_payload),
-                        Err(error) => hub.record(error),
+                    thread::spawn(move || {
+                        match hub.start_forward_open(&remote, &reader, &socket) {
+                            Ok(()) => proxy(socket, reader, hub.max_payload),
+                            Err(error) => hub.record(error),
+                        }
                     });
                     Ok(())
                 })();

@@ -33,6 +33,7 @@ dependencies = [
  "libadb",
  "log",
  "mdns-sd",
+ "mio",
  "num-bigint-dig",
  "num-traits",
  "num_enum",

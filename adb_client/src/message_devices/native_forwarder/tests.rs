@@ -390,3 +390,52 @@ fn receive_window_overflow_wakes_an_unlimited_reader() {
     assert_eq!(bytes, b"datadata");
     worker.join().unwrap();
 }
+
+#[test]
+fn disconnected_client_releases_an_unacknowledged_open() {
+    for buffered in [false, true] {
+        let (mut controller, _, received, _) = fixture_with_timeout(None);
+        let address = controller
+            .forward("127.0.0.1:0".parse().unwrap(), "tcp:7000")
+            .unwrap();
+        let mut socket = TcpStream::connect(address).unwrap();
+        let opened = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let local = opened.header().arg0();
+        if buffered {
+            socket
+                .write_all(b"queued before OPEN acknowledgment")
+                .unwrap();
+        }
+        drop(socket);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.hub.streams.lock().unwrap().contains_key(&local)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let released = !controller.hub.streams.lock().unwrap().contains_key(&local);
+        controller.close().unwrap();
+        assert!(
+            released,
+            "disconnected client retained a pending stream reservation (buffered={buffered})"
+        );
+    }
+}
+
+#[test]
+fn data_sent_before_open_acknowledgment_is_preserved() {
+    let (mut controller, replies, received, _) = fixture_with_timeout(None);
+    let address = controller
+        .forward("127.0.0.1:0".parse().unwrap(), "tcp:7000")
+        .unwrap();
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket.write_all(b"early bytes").unwrap();
+    let opened = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let local = opened.header().arg0();
+    replies.send(packet(Command::Okay, 42, local, &[])).unwrap();
+    let message = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(message.header().command(), Command::Write);
+    assert_eq!(message.payload(), b"early bytes");
+    replies.send(packet(Command::Okay, 42, local, &[])).unwrap();
+    controller.close().unwrap();
+}
