@@ -21,6 +21,13 @@ const SYNC_DATA_MAX_SIZE: usize = 64 * 1024;
 /// Size of a sync chunk header (identifier and length).
 pub(crate) const SYNC_HEADER_SIZE: usize = 8;
 
+pub(crate) fn belongs_to_stream(message: &ADBTransportMessage, local: u32, remote: u32) -> bool {
+    message.header().arg1() == local
+        && (message.header().arg0() == remote
+            // Older adbd versions also used remote-id zero for normal closes.
+            || (message.header().command() == MessageCommand::Clse && message.header().arg0() == 0))
+}
+
 /// Represent a session between an `ADBDevice` and remote `adbd`.
 #[derive(Debug)]
 pub struct ADBSession<T: ADBMessageTransport> {
@@ -58,15 +65,37 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         self.max_payload_size
     }
 
-    /// Receive a message and acknowledge it by replying with an `OKAY` command
+    /// Read only messages belonging to this session; late frames from closed
+    /// streams must not affect its output, acknowledgments or lifetime.
+    pub(crate) fn read_session_message(&mut self) -> Result<ADBTransportMessage> {
+        loop {
+            let message = self.transport.read_message()?;
+            match message.header().command() {
+                MessageCommand::Okay | MessageCommand::Write | MessageCommand::Clse => {
+                    if belongs_to_stream(&message, self.local_id, self.remote_id) {
+                        return Ok(message);
+                    }
+                }
+                command => {
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "Unexpected session command {command}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Receive a current-session message and acknowledge only a `WRTE`.
     pub(crate) fn recv_and_reply_okay(&mut self) -> Result<ADBTransportMessage> {
-        let message = self.transport.read_message()?;
-        self.transport.write_message(ADBTransportMessage::try_new(
-            MessageCommand::Okay,
-            self.local_id,
-            self.remote_id,
-            &[],
-        )?)?;
+        let message = self.read_session_message()?;
+        if message.header().command() == MessageCommand::Write {
+            self.transport.write_message(ADBTransportMessage::try_new(
+                MessageCommand::Okay,
+                self.local_id,
+                self.remote_id,
+                &[],
+            )?)?;
+        }
         Ok(message)
     }
 
@@ -77,7 +106,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
     ) -> Result<ADBTransportMessage> {
         self.transport.write_message(message)?;
 
-        self.transport.read_message().and_then(|message| {
+        self.read_session_message().and_then(|message| {
             message.assert_command(MessageCommand::Okay)?;
             Ok(message)
         })
@@ -91,7 +120,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
     pub(crate) fn recv_until_close(&mut self) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         loop {
-            let message = self.transport.read_message()?;
+            let message = self.read_session_message()?;
             match message.header().command() {
                 MessageCommand::Okay => {}
                 MessageCommand::Write => {
@@ -203,7 +232,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         self.send_and_expect_okay(message)?;
 
         // Command should end with a Write => Okay
-        let received = self.transport.read_message()?;
+        let received = self.read_session_message()?;
         match received.header().command() {
             MessageCommand::Write => Ok(()),
             c => Err(RustADBError::ADBRequestFailed(format!(
@@ -228,7 +257,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
             remote_path.as_bytes(),
         )?)?;
 
-        let response = self.transport.read_message()?;
+        let response = self.read_session_message()?;
         // Skip first 4 bytes as this is the literal "STAT".
         // Interesting part starts right after
 

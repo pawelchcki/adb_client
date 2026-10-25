@@ -5,12 +5,15 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
+type OpenScript = fn(u32, &mpsc::Sender<ADBTransportMessage>);
+
 #[derive(Clone, Debug)]
 struct FakeTransport {
     incoming: Arc<Mutex<mpsc::Receiver<ADBTransportMessage>>>,
     replies: mpsc::Sender<ADBTransportMessage>,
     sent: Arc<Mutex<Vec<ADBTransportMessage>>>,
     shell_output: Option<Vec<u8>>,
+    on_open: Option<OpenScript>,
 }
 
 impl ADBTransport for FakeTransport {
@@ -28,11 +31,11 @@ fn packet(command: MessageCommand, remote: u32, local: u32, bytes: &[u8]) -> ADB
 }
 
 impl ADBMessageTransport for FakeTransport {
-    fn read_message_with_timeout(&mut self, _: Duration) -> Result<ADBTransportMessage> {
+    fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
         self.incoming
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(timeout.min(Duration::from_secs(2)))
             .map_err(|err| Error::new(ErrorKind::TimedOut, err).into())
     }
 
@@ -47,6 +50,10 @@ impl ADBMessageTransport for FakeTransport {
         self.sent.lock().unwrap().push(message);
         match command {
             MessageCommand::Open => {
+                if let Some(script) = self.on_open {
+                    script(local, &self.replies);
+                    return Ok(());
+                }
                 self.replies
                     .send(packet(MessageCommand::Okay, 7, local, &[]))
                     .unwrap();
@@ -78,8 +85,149 @@ fn device(output: Option<&[u8]>) -> ADBMessageDevice<FakeTransport> {
             replies,
             sent: Arc::default(),
             shell_output: output.map(<[u8]>::to_vec),
+            on_open: None,
         },
         max_payload_size: 4096,
+    }
+}
+
+fn scripted_device(script: OpenScript) -> ADBMessageDevice<FakeTransport> {
+    let mut device = device(None);
+    device.transport.on_open = Some(script);
+    device
+}
+
+fn stale_local(local: u32) -> u32 {
+    if local == 1 { 2 } else { 1 }
+}
+
+fn queue_open(local: u32, replies: &mpsc::Sender<ADBTransportMessage>) {
+    for message in [
+        packet(MessageCommand::Okay, 17, stale_local(local), &[]),
+        packet(MessageCommand::Clse, 17, stale_local(local), &[]),
+        packet(MessageCommand::Write, 17, stale_local(local), b"stale"),
+        packet(MessageCommand::Okay, 7, local, &[]),
+    ] {
+        replies.send(message).unwrap();
+    }
+}
+
+#[test]
+fn open_waits_for_its_own_ready_without_acknowledging_stale_packets() {
+    let mut device = scripted_device(queue_open);
+    let session = device.open_session(&ADBLocalCommand::Shell).unwrap();
+    assert_ne!(session.local_id(), 0);
+    assert_eq!(session.remote_id(), 7);
+    let sent = device.transport.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].header().command(), MessageCommand::Open);
+}
+
+#[test]
+fn open_still_rejects_current_close_early_data_and_zero_remote_id() {
+    fn rejected(local: u32, replies: &mpsc::Sender<ADBTransportMessage>) {
+        replies
+            .send(packet(MessageCommand::Clse, 0, local, &[]))
+            .unwrap();
+    }
+    fn early_data(local: u32, replies: &mpsc::Sender<ADBTransportMessage>) {
+        replies
+            .send(packet(MessageCommand::Write, 7, local, b"early"))
+            .unwrap();
+    }
+    fn zero_remote(local: u32, replies: &mpsc::Sender<ADBTransportMessage>) {
+        replies
+            .send(packet(MessageCommand::Okay, 0, local, &[]))
+            .unwrap();
+    }
+    for script in [rejected as OpenScript, early_data, zero_remote] {
+        let mut device = scripted_device(script);
+        assert!(device.open_session(&ADBLocalCommand::Shell).is_err());
+        assert_eq!(device.transport.sent.lock().unwrap().len(), 1);
+    }
+}
+
+fn queue_shell(local: u32, replies: &mpsc::Sender<ADBTransportMessage>) {
+    queue_shell_with_close(local, replies, 7);
+}
+
+fn queue_shell_with_close(
+    local: u32,
+    replies: &mpsc::Sender<ADBTransportMessage>,
+    close_remote: u32,
+) {
+    queue_open(local, replies);
+    for message in [
+        packet(MessageCommand::Write, 17, stale_local(local), b"old stream"),
+        packet(MessageCommand::Write, 99, local, b"wrong remote"),
+        packet(MessageCommand::Clse, 99, local, &[]),
+        packet(MessageCommand::Clse, 17, stale_local(local), &[]),
+        packet(MessageCommand::Write, 7, local, b"current"),
+        packet(MessageCommand::Okay, 7, local, &[]),
+        packet(MessageCommand::Clse, close_remote, local, &[]),
+    ] {
+        replies.send(message).unwrap();
+    }
+}
+
+#[test]
+fn sequential_shells_ignore_stale_output_and_close_and_ack_only_current_data() {
+    let mut device = scripted_device(queue_shell);
+    for _ in 0..2 {
+        let mut output = Vec::new();
+        device
+            .shell_command(&"id", Some(&mut output), None)
+            .unwrap();
+        assert_eq!(output, b"current");
+    }
+    let sent = device.transport.sent.lock().unwrap();
+    let opens: Vec<_> = sent
+        .iter()
+        .filter(|m| m.header().command() == MessageCommand::Open)
+        .collect();
+    let acks: Vec<_> = sent
+        .iter()
+        .filter(|m| m.header().command() == MessageCommand::Okay)
+        .collect();
+    assert_eq!(opens.len(), 2);
+    assert_eq!(acks.len(), 2);
+    for (open, ack) in opens.into_iter().zip(acks) {
+        assert_eq!(ack.header().arg0(), open.header().arg0());
+        assert_eq!(ack.header().arg1(), 7);
+    }
+}
+
+#[test]
+fn interactive_shell_filters_both_ids_and_accepts_legacy_close() {
+    #[derive(Clone, Default)]
+    struct Output(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn legacy(local: u32, replies: &mpsc::Sender<ADBTransportMessage>) {
+        queue_shell_with_close(local, replies, 0);
+    }
+    for script in [queue_shell as OpenScript, legacy] {
+        let mut device = scripted_device(script);
+        let output = Output::default();
+        device
+            .shell(Box::new(std::io::empty()), Box::new(output.clone()))
+            .unwrap();
+        assert_eq!(*output.0.lock().unwrap(), b"current");
+        let sent = device.transport.sent.lock().unwrap();
+        let acks: Vec<_> = sent
+            .iter()
+            .filter(|m| m.header().command() == MessageCommand::Okay)
+            .collect();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].header().arg0(), sent[0].header().arg0());
+        assert_eq!(acks[0].header().arg1(), 7);
     }
 }
 
