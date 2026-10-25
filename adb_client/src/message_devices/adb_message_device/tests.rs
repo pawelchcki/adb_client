@@ -232,6 +232,52 @@ fn interactive_shell_filters_both_ids_and_accepts_legacy_close() {
 }
 
 #[test]
+fn fragmented_list_ignores_stale_initial_and_continuation_packets() {
+    fn listing(local: u32, replies: &mpsc::Sender<ADBTransportMessage>) {
+        queue_open(local, replies);
+        let metadata: Vec<u8> = [0o100_644_u32, 123, 456, 4]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut tail = b"fileDONE".to_vec();
+        tail.extend_from_slice(&[0; 16]);
+        for message in [
+            // Acknowledge LIST, then interleave old stream data at each boundary.
+            packet(MessageCommand::Okay, 7, local, &[]),
+            packet(MessageCommand::Write, 17, stale_local(local), b"DONE"),
+            packet(MessageCommand::Write, 7, local, b"DENT"),
+            packet(MessageCommand::Write, 99, local, &[0; 16]),
+            packet(MessageCommand::Write, 7, local, &metadata),
+            packet(MessageCommand::Clse, 17, stale_local(local), &[]),
+            packet(MessageCommand::Write, 7, local, &tail),
+            packet(MessageCommand::Okay, 17, stale_local(local), &[]),
+            // Acknowledge QUIT and close the active synchronization stream.
+            packet(MessageCommand::Okay, 7, local, &[]),
+            packet(MessageCommand::Clse, 99, local, &[]),
+            packet(MessageCommand::Clse, 7, local, &[]),
+        ] {
+            replies.send(message).unwrap();
+        }
+    }
+    let mut device = scripted_device(listing);
+    assert_eq!(
+        device.list("/data/local/tmp").unwrap(),
+        vec![crate::ADBListItemType::File(crate::ADBListItem {
+            name: "file".into(),
+            time: 456,
+            permissions: 0o644,
+            size: 123,
+        })]
+    );
+    let sent = device.transport.sent.lock().unwrap();
+    let local = sent[0].header().arg0();
+    for message in sent.iter().skip(1) {
+        assert_eq!(message.header().arg0(), local);
+        assert_eq!(message.header().arg1(), 7);
+    }
+}
+
+#[test]
 fn handshake_rejects_payload_limits_that_cannot_hold_sync_data() {
     for limit in 0..=8 {
         let cnxn = packet(MessageCommand::Cnxn, 0x0100_0000, limit, b"device::\0");
