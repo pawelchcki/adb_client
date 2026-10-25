@@ -53,7 +53,7 @@ struct StreamState {
     hub: Weak<Hub>,
     flow: Mutex<Flow>,
     changed: Condvar,
-    incoming: SyncSender<Option<Vec<u8>>>,
+    incoming: Mutex<Option<SyncSender<Vec<u8>>>>,
     socket: Mutex<Option<TcpStream>>,
 }
 
@@ -125,7 +125,11 @@ impl StreamState {
             {
                 let _ = hub.send(Command::Clse, self.local, remote, &[]);
             }
-            let _ = self.incoming.try_send(None);
+            // Disconnecting the sender wakes the reader even when its bounded
+            // queue is full, while preserving data already queued before EOF.
+            if let Ok(mut incoming) = self.incoming.lock() {
+                incoming.take();
+            }
         }
         if abort
             && let Ok(socket) = self.socket.lock()
@@ -138,7 +142,7 @@ impl StreamState {
 
 struct StreamReader {
     state: Arc<StreamState>,
-    incoming: Receiver<Option<Vec<u8>>>,
+    incoming: Receiver<Vec<u8>>,
     bytes: Vec<u8>,
     offset: usize,
 }
@@ -163,27 +167,22 @@ impl Read for StreamReader {
             }
             let hub = self.state.hub.upgrade().ok_or_else(broken)?;
             let next = match hub.timeout {
-                Some(timeout) => {
-                    self.incoming
-                        .recv_timeout(timeout)
-                        .map_err(|error| match error {
-                            mpsc::RecvTimeoutError::Timeout => {
-                                io::Error::from(io::ErrorKind::TimedOut)
-                            }
-                            mpsc::RecvTimeoutError::Disconnected => broken(),
-                        })?
-                }
-                None => self.incoming.recv().map_err(|_| broken())?,
-            };
-            match next {
-                None => return Ok(0),
-                Some(bytes) => {
-                    self.bytes = bytes;
-                    self.offset = 0;
-                    if self.bytes.is_empty() {
-                        self.acknowledge()?;
+                Some(timeout) => match self.incoming.recv_timeout(timeout) {
+                    Ok(bytes) => bytes,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(io::ErrorKind::TimedOut.into());
                     }
-                }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                },
+                None => match self.incoming.recv() {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Ok(0),
+                },
+            };
+            self.bytes = next;
+            self.offset = 0;
+            if self.bytes.is_empty() {
+                self.acknowledge()?;
             }
         }
     }
@@ -280,8 +279,7 @@ impl Hub {
                 break id;
             }
         };
-        // Classic ADB permits one unacknowledged WRTE in each direction. Leave
-        // room for its close marker without letting a slow stream block others.
+        // Keep each stream bounded without letting a slow reader block others.
         let (send, incoming) = mpsc::sync_channel(2);
         let state = Arc::new(StreamState {
             local,
@@ -292,7 +290,7 @@ impl Hub {
                 closed: false,
             }),
             changed: Condvar::new(),
-            incoming: send,
+            incoming: Mutex::new(Some(send)),
             socket: Mutex::new(socket),
         });
         streams.insert(local, state.clone());
@@ -325,11 +323,16 @@ impl Hub {
             );
         }
         let stream = self.reserve(0, rule, socket)?;
+        self.start_open(service, &stream)?;
+        Ok(stream)
+    }
+
+    fn start_open(&self, service: &str, stream: &StreamReader) -> Result<()> {
         let mut name = service.as_bytes().to_vec();
         name.push(0);
         self.send(Command::Open, stream.state.local, 0, &name)?;
         stream.state.wait(|flow| flow.remote != 0)?;
-        Ok(stream)
+        Ok(())
     }
 
     fn route(self: &Arc<Self>, message: Message) -> Result<()> {
@@ -339,11 +342,30 @@ impl Hub {
         }
         let state = self.streams.lock()?.get(&message.header().arg1()).cloned();
         let Some(state) = state else {
+            // As in AOSP, close a remote service whose OPEN acknowledgment
+            // arrived after its local reader timed out or was cancelled.
+            if message.header().command() == Command::Okay
+                && message.header().arg0() != 0
+                && message.header().arg1() != 0
+            {
+                self.send(
+                    Command::Clse,
+                    message.header().arg1(),
+                    message.header().arg0(),
+                    &[],
+                )?;
+            }
             return Ok(());
         };
         let mut flow = state.flow.lock()?;
         let remote = message.header().arg0();
         if flow.closed {
+            let abandoned_open =
+                flow.remote == 0 && remote != 0 && message.header().command() == Command::Okay;
+            drop(flow);
+            if abandoned_open {
+                self.send(Command::Clse, state.local, remote, &[])?;
+            }
             return Ok(());
         }
         match message.header().command() {
@@ -353,11 +375,12 @@ impl Hub {
                 state.changed.notify_all();
             }
             Command::Write if flow.remote != 0 && flow.remote == remote => {
-                if state
+                let sent = state
                     .incoming
-                    .try_send(Some(message.into_payload()))
-                    .is_err()
-                {
+                    .lock()?
+                    .as_ref()
+                    .is_some_and(|incoming| incoming.try_send(message.into_payload()).is_ok());
+                if !sent {
                     drop(flow);
                     state.finish(true, true);
                     self.record("peer exceeded a native stream receive window");
@@ -602,9 +625,15 @@ impl ADBForwarder {
                 };
                 let result = (|| -> Result<()> {
                     socket.set_nodelay(true)?;
-                    let reader = hub.open(&remote, &active, Some(socket.try_clone()?))?;
-                    let max_payload = hub.max_payload;
-                    thread::spawn(move || proxy(socket, reader, max_payload));
+                    // Reserve before spawning so stalled handshakes cannot
+                    // create more workers than the simultaneous-stream limit.
+                    let reader = hub.reserve(0, &active, Some(socket.try_clone()?))?;
+                    let hub = hub.clone();
+                    let remote = remote.clone();
+                    thread::spawn(move || match hub.start_open(&remote, &reader) {
+                        Ok(()) => proxy(socket, reader, hub.max_payload),
+                        Err(error) => hub.record(error),
+                    });
                     Ok(())
                 })();
                 if let Err(error) = result {

@@ -68,8 +68,7 @@ pub async fn pair_with_key_directory(
     let directory = directory.as_ref().to_path_buf();
     let private_key_path = directory.join("adbkey");
     let (key, tls) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let key =
-            store::load_or_generate(&directory, &mut OsRng, "adb_client").map_err(pairing_error)?;
+        let key = load_pairing_key(&directory)?;
         let identity = TlsIdentity::from_key(&key, &mut OsRng).map_err(pairing_error)?;
         let tls = TlsClientConfig::adb(&identity).map_err(pairing_error)?;
         Ok((key, tls))
@@ -91,6 +90,48 @@ pub async fn pair_with_key_directory(
     tokio::time::timeout(timeout, operation)
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+}
+
+// libadb 0.6's directory creation iterates Windows prefixes and attempts
+// mkdir("C:"), which fails with AccessDenied on ordinary user accounts.
+// Publish a missing private key atomically first, then reuse its normal store.
+#[cfg(windows)]
+fn load_pairing_key(directory: &Path) -> Result<libadb::keys::AdbKey> {
+    use std::{fs, io::Write};
+    let path = directory.join("adbkey");
+    match fs::File::open(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(directory)?;
+            let key =
+                libadb::keys::AdbKey::generate(&mut OsRng, "adb_client").map_err(pairing_error)?;
+            let pem = key.to_pkcs8_pem().map_err(pairing_error)?;
+            let temporary = directory.join(format!(".adbkey.{}.tmp", rand::random::<u128>()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            let published = (|| -> io::Result<()> {
+                file.write_all(pem.as_bytes())?;
+                file.sync_all()?;
+                // Never replace an identity another process already published.
+                match fs::hard_link(&temporary, &path) {
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                    result => result,
+                }
+            })();
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            published?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    store::load_or_generate(directory, &mut OsRng, "adb_client").map_err(pairing_error)
+}
+
+#[cfg(not(windows))]
+fn load_pairing_key(directory: &Path) -> Result<libadb::keys::AdbKey> {
+    store::load_or_generate(directory, &mut OsRng, "adb_client").map_err(pairing_error)
 }
 
 fn pairing_error(error: impl std::fmt::Display) -> RustADBError {

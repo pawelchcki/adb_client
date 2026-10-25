@@ -47,6 +47,17 @@ fn fixture() -> (
     Receiver<Message>,
     Arc<AtomicBool>,
 ) {
+    fixture_with_timeout(Some(Duration::from_secs(3)))
+}
+
+fn fixture_with_timeout(
+    read: Option<Duration>,
+) -> (
+    ADBForwarder,
+    mpsc::Sender<Message>,
+    Receiver<Message>,
+    Arc<AtomicBool>,
+) {
     let (replies, incoming) = mpsc::channel();
     let (outgoing, received) = mpsc::channel();
     let disconnected = Arc::new(AtomicBool::new(false));
@@ -62,7 +73,7 @@ fn fixture() -> (
             transport,
             4096,
             ADBTimeouts {
-                read: Some(Duration::from_secs(3)),
+                read,
                 ..ADBTimeouts::default()
             },
         ),
@@ -292,4 +303,90 @@ fn reverse_routes_only_registered_targets_and_can_remove_an_individual_rule() {
     refused_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     controller.close().unwrap();
     peer.join().unwrap();
+}
+
+#[test]
+fn stalled_open_does_not_block_other_clients_on_the_same_rule() {
+    let (mut controller, replies, received, _) = fixture_with_timeout(None);
+    let address = controller
+        .forward("127.0.0.1:0".parse().unwrap(), "tcp:7000")
+        .unwrap();
+    let _first = TcpStream::connect(address).unwrap();
+    let first = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(first.header().command(), Command::Open);
+    let mut second = TcpStream::connect(address).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let opened = received.recv_timeout(Duration::from_secs(2));
+    if let Ok(opened) = opened {
+        assert_eq!(opened.header().command(), Command::Open);
+        assert_ne!(opened.header().arg0(), first.header().arg0());
+        let local = opened.header().arg0();
+        replies.send(packet(Command::Okay, 42, local, &[])).unwrap();
+        replies
+            .send(packet(Command::Write, 42, local, b"ready"))
+            .unwrap();
+        let mut bytes = [0; 5];
+        second.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"ready");
+    } else {
+        controller.close().unwrap();
+        panic!("a stalled OPEN blocked the next client");
+    }
+    controller.close().unwrap();
+}
+
+#[test]
+fn late_open_acknowledgments_close_the_abandoned_remote_stream() {
+    let (controller, _, received, _) = fixture_with_timeout(None);
+    let rule = Arc::new(Rule::default());
+    let stream = controller.hub.reserve(0, &rule, None).unwrap();
+    let local = stream.state.local;
+    // Cancellation may race the open worker's destruction of its reader.
+    rule.close();
+    controller
+        .hub
+        .route(packet(Command::Okay, 42, local, &[]))
+        .unwrap();
+    let closed_while_present = received.recv_timeout(Duration::from_millis(200));
+    drop(stream);
+    controller
+        .hub
+        .route(packet(Command::Okay, 43, local, &[]))
+        .unwrap();
+    let closed_after_drop = received.recv_timeout(Duration::from_millis(200));
+    controller.close().unwrap();
+    for (message, remote) in [(closed_while_present, 42), (closed_after_drop, 43)] {
+        let message = message.expect("late OPEN acknowledgment was ignored");
+        assert_eq!(message.header().command(), Command::Clse);
+        assert_eq!(message.header().arg0(), local);
+        assert_eq!(message.header().arg1(), remote);
+    }
+}
+
+#[test]
+fn receive_window_overflow_wakes_an_unlimited_reader() {
+    let (controller, _, _, _) = fixture_with_timeout(None);
+    let rule = Arc::new(Rule::default());
+    let mut stream = controller.hub.reserve(42, &rule, None).unwrap();
+    let local = stream.state.local;
+    for _ in 0..3 {
+        controller
+            .hub
+            .route(packet(Command::Write, 42, local, b"data"))
+            .unwrap();
+    }
+    let (done, result) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stream.read_to_end(&mut bytes);
+        done.send((read, bytes)).unwrap();
+    });
+    let outcome = result.recv_timeout(Duration::from_secs(2));
+    controller.close().unwrap();
+    let (read, bytes) = outcome.expect("closed full queue left its reader blocked");
+    read.unwrap();
+    assert_eq!(bytes, b"datadata");
+    worker.join().unwrap();
 }
