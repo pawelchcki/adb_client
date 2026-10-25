@@ -63,6 +63,12 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         })
     }
 
+    pub(crate) fn into_forwarder(self, timeouts: crate::ADBTimeouts) -> crate::ADBForwarder {
+        let transport = self.transport.clone();
+        let maximum = self.max_payload_size;
+        crate::ADBForwarder::new(self, transport, maximum, timeouts)
+    }
+
     pub(crate) const fn get_transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }

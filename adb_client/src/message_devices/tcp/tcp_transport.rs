@@ -13,7 +13,6 @@ use crate::{
     },
 };
 use std::{
-    fs::read_to_string,
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::Arc,
@@ -54,6 +53,10 @@ impl TcpTransport {
     pub(crate) fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
         self.timeouts = timeouts.validate()?;
         Ok(())
+    }
+
+    pub(crate) const fn timeouts(&self) -> crate::ADBTimeouts {
+        self.timeouts
     }
 
     fn get_current_connection(&self) -> Result<Arc<Connection>> {
@@ -125,10 +128,17 @@ impl ADBMessageTransport for TcpTransport {
                 "cannot upgrade a TLS connection".into(),
             ));
         }
-        let pk_content = read_to_string(&self.private_key_path)?;
+        let key = crate::message_devices::models::read_adb_private_key(&self.private_key_path)?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "ADB TLS needs a persisted private key",
+                )
+            })?;
+        let pk_content = key.to_pkcs8_pem()?;
         let key_pair = KeyPair::from_pkcs8_pem_and_sign_algo(&pk_content, &PKCS_RSA_SHA256)?;
         let certificate = certificate_from_pk(&key_pair)?;
-        let private_key = PrivatePkcs8KeyDer::from_pem_file(&self.private_key_path)?;
+        let private_key = PrivatePkcs8KeyDer::from_pem_slice(pk_content.as_bytes())?;
         let mut config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))

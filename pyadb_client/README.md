@@ -77,3 +77,31 @@ cargo run --bin stub_gen
 # Build release Python package
 maturin build --release -m pyadb_client/Cargo.toml
 ```
+
+## Direct TCP devices and binary helpers
+
+A running ADB server can connect a remote device using `server.connect_device`,
+as shown above. To talk directly to an already-enabled TCP adbd endpoint:
+
+```python
+from pyadb_client import PyADBTcpDevice
+
+device = PyADBTcpDevice.new("192.168.1.100:5555")
+device.set_timeouts(read_ms=30_000)
+output = device.shell_command("id")
+packages = device.list_packages("third-party")  # current Android user
+system = device.list_packages("system", user=0)
+device.tap(100, 200)
+with open("screen.png", "wb") as image:
+    image.write(device.screenshot_png())
+raw = device.exec_out("cat /data/local/tmp/binary")
+```
+
+The helpers also exist on server-backed and USB devices. Timeout values are
+milliseconds; `None` means unlimited idle I/O. For multiple connected devices,
+select a specific server device or transport ID. Device feature queries retain
+that selection, including with older ADB servers.
+
+Android 11+ wireless debugging uses a separate pairing port and connect port;
+the TCP constructor expects the connect port and an already trusted host key.
+The Rust crate's optional `pairing` API performs direct pairing without a server.

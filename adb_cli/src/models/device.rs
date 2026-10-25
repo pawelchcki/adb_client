@@ -6,6 +6,27 @@ use super::RebootTypeCommand;
 
 #[derive(Parser, Debug)]
 pub enum DeviceCommands {
+    /// Read raw command output, without a PTY or stdin forwarding
+    ExecOut {
+        /// Write raw bytes to a file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// Capture a PNG screenshot using Android screencap
+    Screenshot { path: Option<PathBuf> },
+    /// Send a touchscreen tap at device coordinates
+    Tap { x: u32, y: u32 },
+    /// List installed Android packages for the current or specified user
+    Packages {
+        #[arg(long, conflicts_with = "third_party")]
+        system: bool,
+        #[arg(long, conflicts_with = "system")]
+        third_party: bool,
+        #[arg(long)]
+        user: Option<u32>,
+    },
     /// Spawn an interactive shell or run a list of commands on the device
     Shell {
         #[arg(trailing_var_arg = true)]

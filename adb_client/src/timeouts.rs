@@ -7,7 +7,7 @@ use std::time::Duration;
 /// they are idle I/O limits, not a total running-time limit for a shell command.
 #[derive(Clone, Copy, Debug)]
 pub struct ADBTimeouts {
-    /// Maximum time for the initial connection and ADB authentication.
+    /// Timeout for the initial TCP connection and ADB handshake reads.
     pub handshake: Option<Duration>,
     /// Maximum idle time while receiving a command's packets.
     pub read: Option<Duration>,

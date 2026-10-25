@@ -78,14 +78,6 @@ pub fn get_single_connected_adb_device() -> Result<Option<ADBDeviceInfo>> {
 
 /// Check whether a device with given descriptor is an ADB device
 fn is_adb_device<T: UsbContext>(device: &Device<T>, des: &DeviceDescriptor) -> bool {
-    const ADB_SUBCLASS: u8 = 0x42;
-    const ADB_PROTOCOL: u8 = 0x1;
-
-    // Some devices require choosing the file transfer mode
-    // for usb debugging to take effect.
-    const BULK_CLASS: u8 = 0xdc;
-    const BULK_ADB_SUBCLASS: u8 = 2;
-
     for n in 0..des.num_configurations() {
         let Ok(config_des) = device.config_descriptor(n) else {
             continue;
@@ -95,14 +87,18 @@ fn is_adb_device<T: UsbContext>(device: &Device<T>, des: &DeviceDescriptor) -> b
                 let proto = interface_des.protocol_code();
                 let class = interface_des.class_code();
                 let subcl = interface_des.sub_class_code();
-                if proto == ADB_PROTOCOL
-                    && ((class == LIBUSB_CLASS_VENDOR_SPEC && subcl == ADB_SUBCLASS)
-                        || (class == BULK_CLASS && subcl == BULK_ADB_SUBCLASS))
-                {
+                if is_adb_interface(class, subcl, proto) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+// Discovery and endpoint selection must agree, including legacy MTP/ADB interfaces.
+pub(crate) const fn is_adb_interface(class: u8, subclass: u8, protocol: u8) -> bool {
+    protocol == 1
+        && ((class == LIBUSB_CLASS_VENDOR_SPEC && subclass == 0x42)
+            || (class == 0xdc && subclass == 2))
 }

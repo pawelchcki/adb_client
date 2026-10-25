@@ -86,7 +86,10 @@ fn serve(stream: &mut dyn Duplex, prefix: &mpsc::Sender<()>) {
     stream.flush().unwrap();
 }
 
-fn fixture(tls: bool) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyFile>) {
+fn fixture(
+    tls: bool,
+    legacy_key: bool,
+) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyFile>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let config = tls.then(|| {
@@ -123,6 +126,14 @@ fn fixture(tls: bool) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyF
         serve(&mut *stream, &prefix_tx);
     });
     let key = tls.then(key_file);
+    if legacy_key {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::pkcs8::DecodePrivateKey;
+        let path = &key.as_ref().unwrap().0;
+        let key =
+            rsa::RsaPrivateKey::from_pkcs8_pem(&std::fs::read_to_string(path).unwrap()).unwrap();
+        std::fs::write(path, key.to_pkcs1_pem(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    }
     let path = key.as_ref().map_or_else(PathBuf::new, |key| key.0.clone());
     let mut transport = TcpTransport::new(address, path);
     transport.connect().unwrap();
@@ -133,8 +144,8 @@ fn fixture(tls: bool) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyF
     (transport, peer, key)
 }
 
-fn exercise_duplex(tls: bool) {
-    let (mut transport, peer, _key) = fixture(tls);
+fn exercise_duplex(tls: bool, legacy_key: bool) {
+    let (mut transport, peer, _key) = fixture(tls, legacy_key);
     let mut reader = transport.clone();
     let (started_tx, started_rx) = mpsc::channel();
     let receive = std::thread::spawn(move || {
@@ -176,12 +187,12 @@ fn exercise_duplex(tls: bool) {
 
 #[test]
 fn plaintext_reader_does_not_block_writers_or_interleave_packets() {
-    exercise_duplex(false);
+    exercise_duplex(false, false);
 }
 
 #[test]
 fn tls_reader_does_not_block_writers_or_interleave_packets() {
-    exercise_duplex(true);
+    exercise_duplex(true, false);
 }
 
 #[test]
@@ -215,4 +226,9 @@ fn native_handshake_timeout_does_not_wait_for_the_default_read_timeout() {
     );
     release.send(()).unwrap();
     peer.join().unwrap();
+}
+
+#[test]
+fn tls_accepts_a_legacy_adb_pkcs1_identity_without_rewriting_it() {
+    exercise_duplex(true, true);
 }

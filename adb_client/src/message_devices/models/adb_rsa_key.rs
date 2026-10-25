@@ -68,7 +68,7 @@ impl ADBRsaKey {
         })
     }
 
-    #[cfg(feature = "webusb")]
+    #[cfg(any(feature = "webusb", not(target_arch = "wasm32")))]
     pub(crate) fn to_pkcs8_pem(&self) -> Result<String> {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
         self.private_key
@@ -140,6 +140,12 @@ pub fn read_adb_private_key<P: AsRef<Path>>(private_key_path: P) -> Result<Optio
         Err(e) => return Err(e.into()),
     };
 
+    if pk.contains("BEGIN RSA PRIVATE KEY") {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+        let private_key = RsaPrivateKey::from_pkcs1_pem(&pk)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        return Ok(Some(ADBRsaKey { private_key }));
+    }
     match ADBRsaKey::new_from_pkcs8(&pk) {
         Ok(pk) => Ok(Some(pk)),
         Err(e) => Err(e),

@@ -86,7 +86,7 @@ pub enum RustADBError {
     /// Generic USB error
     #[cfg(all(feature = "usb", not(target_arch = "wasm32")))]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
-    #[error("USB Error: {0}")]
+    #[error("USB Error: {0}{hint}", hint = usb_driver_hint(*.0))]
     UsbError(#[from] rusb::Error),
     /// Selected device is busy.
     #[cfg(all(feature = "usb", not(target_arch = "wasm32")))]
@@ -163,5 +163,31 @@ pub enum RustADBError {
 impl<T> From<std::sync::PoisonError<T>> for RustADBError {
     fn from(_err: std::sync::PoisonError<T>) -> Self {
         Self::PoisonError
+    }
+}
+
+#[cfg(all(feature = "usb", not(target_arch = "wasm32")))]
+fn usb_driver_hint(error: rusb::Error) -> &'static str {
+    if cfg!(target_os = "windows") && error == rusb::Error::NotSupported {
+        ". The Windows ADB interface needs a libusb-compatible driver (WinUSB or libusbK). A working OEM adb driver does not establish libusb compatibility. Use the server backend with that driver, or configure the ADB interface for libusb; see the USB README."
+    } else {
+        ""
+    }
+}
+
+#[cfg(all(test, feature = "usb", not(target_arch = "wasm32")))]
+mod usb_error_tests {
+    #[test]
+    fn driver_guidance_preserves_the_public_usb_error_variant() {
+        let error: super::RustADBError = rusb::Error::NotSupported.into();
+        assert!(matches!(
+            error,
+            super::RustADBError::UsbError(rusb::Error::NotSupported)
+        ));
+        if cfg!(target_os = "windows") {
+            assert!(error.to_string().contains("WinUSB"));
+        } else {
+            assert!(!error.to_string().contains("WinUSB"));
+        }
     }
 }

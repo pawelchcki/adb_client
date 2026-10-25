@@ -3,10 +3,7 @@ use std::{
     time::Duration,
 };
 
-use rusb::{
-    Context, Device, DeviceHandle, Direction, TransferType, UsbContext,
-    constants::LIBUSB_CLASS_VENDOR_SPEC,
-};
+use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
 use crate::{
     Result, RustADBError,
@@ -30,8 +27,8 @@ struct Endpoint {
 pub struct USBTransport {
     device: Device<Context>,
     timeouts: crate::ADBTimeouts,
-    receive: Arc<Mutex<PacketReader>>,
-    send: Arc<Mutex<()>>,
+    receive: Option<Arc<Mutex<PacketReader>>>,
+    send: Option<Arc<Mutex<()>>>,
     handle: Option<Arc<DeviceHandle<Context>>>,
     read_endpoint: Option<Endpoint>,
     write_endpoint: Option<Endpoint>,
@@ -60,12 +57,12 @@ impl USBTransport {
     ///
     /// Devices can be enumerated using [`rusb::Context::devices()`] and then filtered out to get desired device.
     #[must_use]
-    pub fn new_from_device(rusb_device: rusb::Device<Context>) -> Self {
+    pub const fn new_from_device(rusb_device: rusb::Device<Context>) -> Self {
         Self {
             device: rusb_device,
-            timeouts: crate::ADBTimeouts::default(),
-            receive: Arc::default(),
-            send: Arc::default(),
+            timeouts: crate::ADBTimeouts::DEFAULT,
+            receive: None,
+            send: None,
             handle: None,
             read_endpoint: None,
             write_endpoint: None,
@@ -124,7 +121,7 @@ impl USBTransport {
             Ok(()) => Ok(()),
             // busy state likely indicates an ADB server is running and has taken the lock over the device
             Err(rusb::Error::Busy) => Err(RustADBError::DeviceBusy),
-            Err(err) => Err(usb_access_error(err)),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -140,9 +137,11 @@ impl USBTransport {
                     let mut write_endpoint: Option<Endpoint> = None;
                     for endpoint_desc in interface_desc.endpoint_descriptors() {
                         if endpoint_desc.transfer_type() == TransferType::Bulk
-                            && interface_desc.class_code() == LIBUSB_CLASS_VENDOR_SPEC
-                            && interface_desc.sub_class_code() == 0x42
-                            && interface_desc.protocol_code() == 0x01
+                            && super::utils::is_adb_interface(
+                                interface_desc.class_code(),
+                                interface_desc.sub_class_code(),
+                                interface_desc.protocol_code(),
+                            )
                         {
                             let endpoint = Endpoint {
                                 iface: interface_desc.interface_number(),
@@ -201,7 +200,7 @@ impl USBTransport {
 
 impl ADBTransport for USBTransport {
     fn connect(&mut self) -> crate::Result<()> {
-        let device = self.device.open().map_err(usb_access_error)?;
+        let device = self.device.open()?;
 
         let (read_endpoint, write_endpoint) = Self::find_endpoints(&device)?;
 
@@ -218,6 +217,8 @@ impl ADBTransport for USBTransport {
         log::debug!("got write endpoint: {write_endpoint:?}");
         self.write_endpoint = Some(write_endpoint);
 
+        self.receive = Some(Arc::default());
+        self.send = Some(Arc::default());
         self.handle = Some(Arc::new(device));
 
         Ok(())
@@ -276,7 +277,11 @@ impl ADBMessageTransport for USBTransport {
             } else {
                 timeout
             };
-        let _send = self.send.lock()?;
+        let _send = self
+            .send
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected))?
+            .lock()?;
         let message_bytes = message.header().as_bytes();
         self.write_bulk_data(&message_bytes, timeout)?;
 
@@ -300,24 +305,17 @@ impl ADBMessageTransport for USBTransport {
             } else {
                 timeout
             };
-        self.receive.lock()?.read(|bytes| {
-            loop {
-                let size = handle.read_bulk(endpoint.address, bytes, timeout)?;
-                if size != 0 {
-                    return Ok(size);
+        self.receive
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected))?
+            .lock()?
+            .read(|bytes| {
+                loop {
+                    let size = handle.read_bulk(endpoint.address, bytes, timeout)?;
+                    if size != 0 {
+                        return Ok(size);
+                    }
                 }
-            }
-        })
+            })
     }
-}
-
-fn usb_access_error(error: rusb::Error) -> RustADBError {
-    #[cfg(target_os = "windows")]
-    if error == rusb::Error::NotSupported {
-        return RustADBError::IOError(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "The Windows ADB interface needs a libusb-compatible driver (WinUSB or libusbK). A working vendor adb driver does not necessarily support libusb. Use the server backend with the vendor driver, or configure only the ADB interface for libusb; see the USB README.",
-        ));
-    }
-    error.into()
 }

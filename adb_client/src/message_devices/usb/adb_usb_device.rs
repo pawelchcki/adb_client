@@ -22,6 +22,32 @@ pub struct ADBUSBDevice {
 }
 
 impl ADBUSBDevice {
+    /// Transfer this connection to a multiplexed native forwarding controller.
+    /// Run ordinary device commands before converting; the controller owns all packet reads.
+    #[must_use]
+    pub fn into_forwarder(mut self) -> crate::ADBForwarder {
+        let timeouts = self.inner.get_transport_mut().timeouts();
+        self.inner.into_forwarder(timeouts)
+    }
+
+    /// Start daemon-free host TCP forwarding and return its owning controller.
+    pub fn forward(self, local: std::net::SocketAddr, remote: &str) -> Result<crate::ADBForwarder> {
+        let mut controller = self.into_forwarder();
+        controller.forward(local, remote)?;
+        Ok(controller)
+    }
+
+    /// Start daemon-free device TCP reverse forwarding and return its controller.
+    pub fn reverse(
+        self,
+        remote_port: u16,
+        local: std::net::SocketAddr,
+    ) -> Result<crate::ADBForwarder> {
+        let mut controller = self.into_forwarder();
+        controller.reverse(remote_port, local)?;
+        Ok(controller)
+    }
+
     /// Instantiate a new [`ADBUSBDevice`]
     pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
         Self::new_with_custom_private_key(vendor_id, product_id, get_default_adb_key_path()?)

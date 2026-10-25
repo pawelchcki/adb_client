@@ -30,3 +30,8 @@ pub use utils::BinaryDecodable;
 #[cfg(feature = "webusb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "webusb")))]
 pub mod webusb;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod native_forwarder;
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_forwarder::ADBForwarder;
