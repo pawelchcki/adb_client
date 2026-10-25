@@ -101,14 +101,10 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             };
 
             // best-effort error shell closing & error reporting
-            match result {
-                Ok(()) => {
-                    let _ = shell_writer.close();
-                }
-                Err(err) => {
-                    let _ = local_result_tx.send(err);
-                }
+            if let Err(err) = result {
+                let _ = local_result_tx.send(err);
             }
+            let _ = shell_writer.close();
         });
 
         let mut transport = self.get_transport_mut().clone();

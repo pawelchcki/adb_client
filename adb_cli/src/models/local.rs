@@ -41,8 +41,8 @@ pub enum ForwardCommand {
 pub enum ReverseCommand {
     /// Remove all reversed ports.
     RemoveAll,
-    /// Remove a specific reversed port.
-    Remove { local: String },
+    /// Remove a specific reversed port by its device endpoint.
+    Remove { remote: String },
     /// Reverse a device port to a local port.
     Add { remote: String, local: String },
 }

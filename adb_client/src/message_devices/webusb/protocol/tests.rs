@@ -49,9 +49,9 @@ impl Transport for Fake {
         }
         Ok(n)
     }
-    async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+    fn write(&mut self, bytes: &[u8]) -> impl std::future::Future<Output = Result<()>> {
         self.output.borrow_mut().extend_from_slice(bytes);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 fn key() -> &'static WebUSBKey {
@@ -152,6 +152,47 @@ fn fragmented_packets_close_and_sequential_streams() {
             ]
         );
         assert_eq!(packets[4].header().arg0(), 2);
+    });
+}
+
+#[test]
+fn rejected_service_can_be_followed_by_a_successful_open() {
+    block_on(async {
+        let fake = Fake::new(&[
+            connected(),
+            message(Command::Clse, 0, 1, &[]),
+            message(Command::Okay, 7, 2, &[]),
+            message(Command::Clse, 7, 2, &[]),
+        ]);
+        let output = fake.output.clone();
+        let mut device = Connection::connect(fake, key()).await.unwrap();
+        assert!(device.open("unavailable:").await.is_err());
+        device
+            .open("shell:id")
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        let packets = written(&output.borrow());
+        assert_eq!(packets[1].header().command(), Command::Open);
+        assert_eq!(packets[2].header().command(), Command::Open);
+        assert_eq!(packets[2].header().arg0(), 2);
+        assert_eq!(packets.len(), 4);
+    });
+}
+
+#[test]
+fn malformed_service_rejections_still_require_reconnect() {
+    block_on(async {
+        for (remote, local, payload) in [(1, 1, &b""[..]), (0, 99, &b""[..]), (0, 1, &b"bad"[..])] {
+            let fake = Fake::new(&[connected(), message(Command::Clse, remote, local, payload)]);
+            let output = fake.output.clone();
+            let mut device = Connection::connect(fake, key()).await.unwrap();
+            assert!(device.open("unavailable:").await.is_err());
+            assert!(device.open("shell:id").await.is_err());
+            assert_eq!(written(&output.borrow()).len(), 2);
+        }
     });
 }
 

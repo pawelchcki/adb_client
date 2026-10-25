@@ -149,6 +149,15 @@ impl<T: Transport> Connection<T> {
         destination.push(0);
         self.send(Command::Open, local, 0, &destination).await?;
         let response = self.receive().await?;
+        if response.header().command() == Command::Clse
+            && response.header().arg0() == 0
+            && response.header().arg1() == local
+            && response.payload().is_empty()
+        {
+            // A complete rejection created no stream and left no unread packet.
+            self.usable = true;
+            return Err(invalid("ADB service open rejected"));
+        }
         response.assert_command(Command::Okay)?;
         if response.header().arg1() != local
             || response.header().arg0() == 0

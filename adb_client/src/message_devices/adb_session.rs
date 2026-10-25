@@ -19,7 +19,7 @@ use crate::{
 const SYNC_DATA_MAX_SIZE: usize = 64 * 1024;
 
 /// Size of a sync chunk header (identifier and length).
-const SYNC_HEADER_SIZE: usize = 8;
+pub(crate) const SYNC_HEADER_SIZE: usize = 8;
 
 /// Represent a session between an `ADBDevice` and remote `adbd`.
 #[derive(Debug)]

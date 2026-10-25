@@ -28,7 +28,7 @@ pub enum RustADBError {
     #[error("Unknown response type {0}")]
     UnknownResponseType(String),
     /// Indicates that a command different from the expected one was received
-    #[error("wrong response: received {1}, expected {0}")]
+    #[error("wrong response: received {0}, expected {1}")]
     WrongResponseReceived(String, String),
     /// Indicates that ADB server responses an unknown device state.
     #[error("Unknown device state {0}")]

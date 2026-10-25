@@ -1,11 +1,15 @@
 use rand::RngExt;
+
+#[cfg(test)]
+mod tests;
+
 use std::{path::Path, time::Duration};
 
 use crate::{
     Result, RustADBError,
     message_devices::{
         adb_message_transport::ADBMessageTransport,
-        adb_session::ADBSession,
+        adb_session::{ADBSession, SYNC_HEADER_SIZE},
         adb_transport_message::{
             ADBTransportMessage, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN, MAX_PAYLOAD_SIZE,
         },
@@ -96,8 +100,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 Self::auth_handshake(transport, message, private_key)
             }
             _ => Err(crate::RustADBError::WrongResponseReceived(
-                "Expected CNXN, STLS or AUTH command".to_string(),
                 message.header().command().to_string(),
+                "CNXN, STLS or AUTH".to_string(),
             )),
         }
     }
@@ -177,6 +181,11 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         // The device answers with the minimum between our maximum payload size and its own
         let max_payload = message.header().arg1().min(MAX_PAYLOAD_SIZE) as usize;
+        if max_payload <= SYNC_HEADER_SIZE {
+            return Err(RustADBError::ADBRequestFailed(format!(
+                "maximum payload size {max_payload} cannot hold sync data"
+            )));
+        }
         log::debug!(
             "device info {}, maximum payload size {max_payload}",
             String::from_utf8_lossy(message.payload()),

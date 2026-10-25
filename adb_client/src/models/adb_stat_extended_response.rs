@@ -55,7 +55,7 @@ impl Display for ADBStatExtendedResponse {
         writeln!(f, "Inode: {}\tLinks: {}", self.inode, self.links)?;
         writeln!(
             f,
-            "Access: ({})\tUid: ({}/{})\tGid: ({}/{})",
+            "Access: ({:04o})\tUid: ({}/{})\tGid: ({}/{})",
             self.perms, self.user.id, self.user.name, self.group.id, self.group.name
         )?;
         writeln!(
@@ -165,7 +165,8 @@ impl ADBStatExtendedResponse {
             RustADBError::StatResponseError("cannot get capture groups for fourth line".into())
         })?;
         let (perms, uid, uid_name, gid, gid_name) = (
-            extract_from_regex_group(&fourth_line_groups, "perms")?,
+            u64::from_str_radix(&fourth_line_groups["perms"], 8)
+                .map_err(|_| RustADBError::StatResponseError("invalid octal permissions".into()))?,
             extract_from_regex_group(&fourth_line_groups, "uid")?,
             extract_from_regex_group(&fourth_line_groups, "uid_name")?,
             extract_from_regex_group(&fourth_line_groups, "gid")?,
@@ -239,6 +240,8 @@ Change: 2024-11-28 16:27:23.276724566 +0100
         assert_eq!(resp.blocks, 2048);
         assert_eq!(resp.io_blocks, 512);
         assert_eq!(resp.links, 1);
+        assert_eq!(resp.perms, 0o777);
+        assert!(resp.to_string().contains("Access: (0777)"));
         assert_eq!(
             resp.user,
             ADBStatMapping {
@@ -256,5 +259,14 @@ Change: 2024-11-28 16:27:23.276724566 +0100
         assert_eq!(resp.atime, 0);
         assert_eq!(resp.mtime, 0);
         assert_eq!(resp.ctime, 1_732_807_643);
+
+        let other = response.replace("0777", "0644");
+        let resp = ADBStatExtendedResponse::try_from(other.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.perms, 0o644);
+        assert!(
+            ADBStatExtendedResponse::try_from(response.replace("0777", "0888").as_bytes()).is_err()
+        );
     }
 }

@@ -44,11 +44,8 @@ pub trait ADBDeviceExt {
         remote_path: &dyn AsRef<str>,
     ) -> Result<Option<ADBStatExtendedResponse>> {
         let mut stdout = Vec::new();
-        self.shell_command(
-            &format!("stat {}", remote_path.as_ref()),
-            Some(&mut stdout),
-            None,
-        )?;
+        let path = remote_path.as_ref().replace('\'', "'\\''");
+        self.shell_command(&format!("stat -- '{path}'"), Some(&mut stdout), None)?;
 
         // all parsing magic happens here...
         ADBStatExtendedResponse::try_from(&stdout)

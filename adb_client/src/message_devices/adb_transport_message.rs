@@ -171,3 +171,18 @@ impl TryFrom<[u8; 24]> for ADBTransportMessageHeader {
         Ok(header)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_error_identifies_received_before_expected() {
+        let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]).unwrap();
+        let error = message.assert_command(MessageCommand::Okay).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "wrong response: received CLSE, expected OKAY"
+        );
+    }
+}
