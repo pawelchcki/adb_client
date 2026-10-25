@@ -2,12 +2,10 @@ use std::net::SocketAddrV4;
 
 use clap::{Parser, Subcommand};
 
-use crate::utils;
-
 use super::{EmulatorCommand, HostCommand, LocalCommand, TcpCommand, UsbCommand};
 
 #[derive(Debug, Parser)]
-#[clap(about, long_version = utils::long_version(), author)]
+#[clap(about, version)]
 pub struct Opts {
     #[clap(long = "debug")]
     pub debug: bool,
@@ -29,8 +27,6 @@ pub enum MainCommand {
     Tcp(TcpCommand),
     /// MDNS discovery related commands
     Mdns,
-    /// Display various version information
-    Version,
 }
 
 #[derive(Debug, Parser)]
@@ -40,6 +36,11 @@ pub struct ServerCommand<T: Subcommand> {
     /// Serial id of a specific device. Every request will be sent to this device.
     #[clap(short = 's', long = "serial")]
     pub serial: Option<String>,
+    /// Transport id of a specific device (as shown by `adb devices -l`). Use this to
+    /// disambiguate devices that share the same serial number. Transport ids are
+    /// reassigned on device reconnect or adb-server restart and should not be cached.
+    #[clap(short = 't', long = "transport-id", conflicts_with = "serial")]
+    pub transport_id: Option<u32>,
     #[clap(subcommand)]
     pub command: T,
 }

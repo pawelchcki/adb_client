@@ -1,10 +1,14 @@
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
-use image::{ImageBuffer, ImageFormat, Rgba};
+#[cfg(feature = "framebuffer")]
+use {
+    image::{ImageBuffer, ImageFormat, Rgba},
+    std::io::Cursor,
+};
 
 use crate::models::{ADBListItemType, AdbStatResponse, RemountInfo};
-use crate::{RebootType, Result};
+use crate::{ADBStatExtendedResponse, RebootType, Result};
 
 /// Trait representing all features available on ADB devices.
 pub trait ADBDeviceExt {
@@ -18,19 +22,34 @@ pub trait ADBDeviceExt {
 
     /// Starts an interactive shell session on the device.
     /// Input data is read from reader and write to writer.
-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()>;
+    fn shell(&mut self, reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Result<()>;
 
     /// Runs command on the device.
     /// Input data is read from reader and write to writer.
     fn exec(
         &mut self,
         command: &str,
-        reader: &mut dyn Read,
+        reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
     ) -> Result<()>;
 
-    /// Display the stat information for a remote file
+    /// Display the stat information for a remote file using STAT protocol command.
     fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse>;
+
+    /// Display the stat information for a remote file using `stat` shell command.
+    /// This is an extended version of `stat` that returns more detailed information.
+    /// Returns `Ok(None)` if the file does not exist on the device.
+    fn stat_extended(
+        &mut self,
+        remote_path: &dyn AsRef<str>,
+    ) -> Result<Option<ADBStatExtendedResponse>> {
+        let mut stdout = Vec::new();
+        let path = remote_path.as_ref().replace('\'', "'\\''");
+        self.shell_command(&format!("stat -- '{path}'"), Some(&mut stdout), None)?;
+
+        // all parsing magic happens here...
+        ADBStatExtendedResponse::try_from(&stdout)
+    }
 
     /// Pull the remote file pointed to by `source` and write its contents into `output`
     fn pull(&mut self, source: &dyn AsRef<str>, output: &mut dyn Write) -> Result<()>;
@@ -83,12 +102,14 @@ pub trait ADBDeviceExt {
     /// Disable dm-verity on the device
     fn disable_verity(&mut self) -> Result<()>;
 
+    #[cfg(feature = "framebuffer")]
     /// Inner method requesting framebuffer from an Android device
     fn framebuffer_inner(&mut self) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>>;
 
     /// Dump framebuffer of this device into given path.
     ///
     /// Output data format is currently only `PNG`.
+    #[cfg(feature = "framebuffer")]
     fn framebuffer(&mut self, path: &dyn AsRef<Path>) -> Result<()> {
         // Big help from AOSP source code (<https://android.googlesource.com/platform/system/adb/+/refs/heads/main/framebuffer_service.cpp>)
         let img = self.framebuffer_inner()?;
@@ -98,6 +119,7 @@ pub trait ADBDeviceExt {
     /// Dump framebuffer of this device and return corresponding bytes.
     ///
     /// Output data format is currently only `PNG`.
+    #[cfg(feature = "framebuffer")]
     fn framebuffer_bytes(&mut self) -> Result<Vec<u8>> {
         let img = self.framebuffer_inner()?;
         let mut vec = Cursor::new(Vec::new());

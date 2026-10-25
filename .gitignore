@@ -1,6 +1,9 @@
 target
-/Cargo.lock
 /.vscode
 venv
 /.mypy_cache
 pyadb_client/pyadb_client.pyi
+__pycache__
+/adb_client/tests/assets/*.apk
+
+/examples/webusb/pkg/

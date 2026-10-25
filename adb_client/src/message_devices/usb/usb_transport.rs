@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use rusb::{
-    Device, DeviceHandle, Direction, GlobalContext, TransferType,
+    Context, Device, DeviceHandle, Direction, TransferType, UsbContext,
     constants::LIBUSB_CLASS_VENDOR_SPEC,
 };
 
@@ -25,8 +25,8 @@ struct Endpoint {
 /// Transport running on USB
 #[derive(Debug, Clone)]
 pub struct USBTransport {
-    device: Device<GlobalContext>,
-    handle: Option<Arc<DeviceHandle<GlobalContext>>>,
+    device: Device<Context>,
+    handle: Option<Arc<DeviceHandle<Context>>>,
     read_endpoint: Option<Endpoint>,
     write_endpoint: Option<Endpoint>,
 }
@@ -35,7 +35,8 @@ impl USBTransport {
     /// Instantiate a new [`USBTransport`].
     /// Only the first device with given `vendor_id` and `product_id` is returned.
     pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
-        for device in rusb::devices()?.iter() {
+        let context = Context::new()?;
+        for device in context.devices()?.iter() {
             if let Ok(descriptor) = device.device_descriptor()
                 && descriptor.vendor_id() == vendor_id
                 && descriptor.product_id() == product_id
@@ -51,9 +52,9 @@ impl USBTransport {
 
     /// Instantiate a new [`USBTransport`] from a [`rusb::Device`].
     ///
-    /// Devices can be enumerated using [`rusb::devices()`] and then filtered out to get desired device.
+    /// Devices can be enumerated using [`rusb::Context::devices()`] and then filtered out to get desired device.
     #[must_use]
-    pub const fn new_from_device(rusb_device: rusb::Device<GlobalContext>) -> Self {
+    pub const fn new_from_device(rusb_device: rusb::Device<Context>) -> Self {
         Self {
             device: rusb_device,
             handle: None,
@@ -62,7 +63,15 @@ impl USBTransport {
         }
     }
 
-    pub(crate) fn get_raw_connection(&self) -> Result<Arc<DeviceHandle<GlobalContext>>> {
+    pub(crate) fn vendor_id(&self) -> Result<u16> {
+        Ok(self.device.device_descriptor().map(|d| d.vendor_id())?)
+    }
+
+    pub(crate) fn product_id(&self) -> Result<u16> {
+        Ok(self.device.device_descriptor().map(|d| d.product_id())?)
+    }
+
+    pub(crate) fn get_raw_connection(&self) -> Result<Arc<DeviceHandle<Context>>> {
         self.handle
             .as_ref()
             .ok_or(RustADBError::IOError(std::io::Error::new(
@@ -91,7 +100,7 @@ impl USBTransport {
             )))
     }
 
-    fn configure_endpoint(handle: &DeviceHandle<GlobalContext>, endpoint: &Endpoint) -> Result<()> {
+    fn configure_endpoint(handle: &DeviceHandle<Context>, endpoint: &Endpoint) -> Result<()> {
         match handle.claim_interface(endpoint.iface) {
             Ok(()) => Ok(()),
             // busy state likely indicates an ADB server is running and has taken the lock over the device
@@ -100,7 +109,7 @@ impl USBTransport {
         }
     }
 
-    fn find_endpoints(handle: &DeviceHandle<GlobalContext>) -> Result<(Endpoint, Endpoint)> {
+    fn find_endpoints(handle: &DeviceHandle<Context>) -> Result<(Endpoint, Endpoint)> {
         let mut read_endpoint: Option<Endpoint> = None;
         let mut write_endpoint: Option<Endpoint> = None;
 
@@ -153,8 +162,7 @@ impl USBTransport {
         let mut offset = 0;
         let data_len = data.len();
         while offset < data_len {
-            let end = (offset + max_packet_size).min(data_len);
-            let write_amount = handle.write_bulk(endpoint.address, &data[offset..end], timeout)?;
+            let write_amount = handle.write_bulk(endpoint.address, &data[offset..], timeout)?;
             offset += write_amount;
 
             log::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
@@ -253,9 +261,7 @@ impl ADBMessageTransport for USBTransport {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
             let mut offset = 0;
             while offset < msg_data.len() {
-                let end = (offset + max_packet_size).min(msg_data.len());
-                let chunk = &mut msg_data[offset..end];
-                offset += handle.read_bulk(endpoint.address, chunk, timeout)?;
+                offset += handle.read_bulk(endpoint.address, &mut msg_data[offset..], timeout)?;
             }
 
             let message = ADBTransportMessage::from_header_and_payload(header, msg_data);

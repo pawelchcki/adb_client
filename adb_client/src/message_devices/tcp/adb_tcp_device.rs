@@ -26,7 +26,10 @@ impl ADBTcpDevice {
         private_key_path: P,
     ) -> Result<Self> {
         Ok(Self {
-            inner: ADBMessageDevice::new(TcpTransport::new(address)?, private_key_path)?,
+            inner: ADBMessageDevice::new(
+                TcpTransport::new(address, &private_key_path),
+                private_key_path,
+            )?,
         })
     }
 }
@@ -43,7 +46,7 @@ impl ADBDeviceExt for ADBTcpDevice {
     }
 
     #[inline]
-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
+    fn shell(&mut self, reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Result<()> {
         self.inner.shell(reader, writer)
     }
 
@@ -98,6 +101,7 @@ impl ADBDeviceExt for ADBTcpDevice {
     }
 
     #[inline]
+    #[cfg(feature = "framebuffer")]
     fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
         self.inner.framebuffer_inner()
     }
@@ -111,7 +115,7 @@ impl ADBDeviceExt for ADBTcpDevice {
     fn exec(
         &mut self,
         command: &str,
-        reader: &mut dyn Read,
+        reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
     ) -> Result<()> {
         self.inner.exec(command, reader, writer)

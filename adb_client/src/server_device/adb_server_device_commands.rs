@@ -41,28 +41,134 @@ impl ADBDeviceExt for ADBServerDevice {
     fn shell_command(
         &mut self,
         command: &dyn AsRef<str>,
-        mut stdout: Option<&mut dyn Write>,
-        mut stderr: Option<&mut dyn Write>,
+        stdout: Option<&mut dyn Write>,
+        stderr: Option<&mut dyn Write>,
     ) -> Result<Option<u8>> {
-        let supported_features = self.host_features()?;
-        if !supported_features.contains(&HostFeatures::ShellV2)
-            && !supported_features.contains(&HostFeatures::Cmd)
-        {
-            return Err(RustADBError::ADBShellNotSupported);
-        }
+        let supported_features = self.host_features();
+        let use_shell_v2 = supported_features.is_ok_and(|features| {
+            features.contains(&HostFeatures::ShellV2) || features.contains(&HostFeatures::Cmd)
+        });
 
         self.set_serial_transport()?;
 
-        // Prepare shell command arguments
-        let mut args = Vec::new();
+        if use_shell_v2 {
+            self.shell_command_v2(command, stdout, stderr)
+        } else {
+            self.shell_command_v1(command, stdout)
+        }
+    }
 
-        // Add v2 mode if supported
-        if supported_features.contains(&HostFeatures::ShellV2) {
-            log::debug!("using shell_v2 feature");
-            args.push("v2".to_string());
+    #[inline]
+    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
+        self.stat(remote_path.as_ref())
+    }
+
+    fn exec(
+        &mut self,
+        command: &str,
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+    ) -> Result<()> {
+        self.bidirectional_session(
+            &ADBCommand::Local(ADBLocalCommand::Exec(command.to_owned())),
+            reader,
+            writer,
+        )
+    }
+
+    fn shell(&mut self, reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Result<()> {
+        self.bidirectional_session(&ADBCommand::Local(ADBLocalCommand::Shell), reader, writer)
+    }
+
+    fn pull(&mut self, source: &dyn AsRef<str>, mut output: &mut dyn Write) -> Result<()> {
+        self.pull(source, &mut output)
+    }
+
+    fn reboot(&mut self, reboot_type: crate::RebootType) -> Result<()> {
+        self.reboot(reboot_type)
+    }
+
+    fn root(&mut self) -> Result<()> {
+        self.root()
+    }
+
+    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
+        self.push(stream, path)
+    }
+
+    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
+        self.install(apk_path, user)
+    }
+
+    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
+        self.uninstall(package.as_ref(), user)
+    }
+
+    #[cfg(feature = "framebuffer")]
+    fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+        self.framebuffer_inner()
+    }
+
+    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
+        self.list(path)
+    }
+
+    fn remount(&mut self) -> Result<Vec<RemountInfo>> {
+        self.remount()
+    }
+
+    fn enable_verity(&mut self) -> Result<()> {
+        self.enable_verity()
+    }
+
+    fn disable_verity(&mut self) -> Result<()> {
+        self.disable_verity()
+    }
+}
+
+impl ADBServerDevice {
+    /// Shell v1: simple shell without protocol (for older ADB versions)
+    fn shell_command_v1(
+        &self,
+        command: &dyn AsRef<str>,
+        mut stdout: Option<&mut dyn Write>,
+    ) -> Result<Option<u8>> {
+        self.transport
+            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellCommand(
+                command.as_ref().to_string(),
+                vec![],
+            )))?;
+
+        let mut input = self.transport.get_raw_connection()?;
+        let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
+
+        loop {
+            match input.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    if let Some(stdout) = stdout.as_mut() {
+                        stdout.write_all(&buffer[..size])?;
+                    }
+                }
+                Err(e) => match e.kind() {
+                    ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => break,
+                    _ => return Err(RustADBError::IOError(e)),
+                },
+            }
         }
 
-        // Include terminal information if available
+        Ok(None)
+    }
+
+    /// Shell v2: with protocol packets (for newer ADB versions)
+    fn shell_command_v2(
+        &self,
+        command: &dyn AsRef<str>,
+        mut stdout: Option<&mut dyn Write>,
+        mut stderr: Option<&mut dyn Write>,
+    ) -> Result<Option<u8>> {
+        let mut args = vec!["v2".to_string()];
+
         if let Ok(term) = std::env::var("TERM") {
             args.push(format!("TERM={term}"));
         }
@@ -159,125 +265,69 @@ impl ADBDeviceExt for ADBServerDevice {
         }
     }
 
-    #[inline]
-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
-        self.stat(remote_path.as_ref())
-    }
-
-    fn exec(
-        &mut self,
-        command: &str,
-        reader: &mut dyn Read,
-        writer: Box<dyn Write + Send>,
-    ) -> Result<()> {
-        self.bidirectional_session(
-            &ADBCommand::Local(ADBLocalCommand::Exec(command.to_owned())),
-            reader,
-            writer,
-        )
-    }
-
-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
-        self.bidirectional_session(&ADBCommand::Local(ADBLocalCommand::Shell), reader, writer)
-    }
-
-    fn pull(&mut self, source: &dyn AsRef<str>, mut output: &mut dyn Write) -> Result<()> {
-        self.pull(source, &mut output)
-    }
-
-    fn reboot(&mut self, reboot_type: crate::RebootType) -> Result<()> {
-        self.reboot(reboot_type)
-    }
-
-    fn root(&mut self) -> Result<()> {
-        self.root()
-    }
-
-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
-        self.push(stream, path)
-    }
-
-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
-        self.install(apk_path, user)
-    }
-
-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
-        self.uninstall(package.as_ref(), user)
-    }
-
-    fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
-        self.framebuffer_inner()
-    }
-
-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
-        self.list(path)
-    }
-
-    fn remount(&mut self) -> Result<Vec<RemountInfo>> {
-        self.remount()
-    }
-
-    fn enable_verity(&mut self) -> Result<()> {
-        self.enable_verity()
-    }
-
-    fn disable_verity(&mut self) -> Result<()> {
-        self.disable_verity()
-    }
-}
-
-impl ADBServerDevice {
+    /// Starts a bidirectional (interactive) session. This can be a shell or an exec session.
+    ///
+    /// Data read from `reader` is forwarded to the server from a background thread, while server output
+    /// is written to `writer` from the current thread. The session ends once the server closes the stream:
+    /// either because the remote command exited, or because we half-closed it after `reader` reached EOF.
     fn bidirectional_session(
         &mut self,
         server_cmd: &ADBCommand,
-        mut reader: &mut dyn Read,
+        mut reader: Box<dyn Read + Send>,
         mut writer: Box<dyn Write + Send>,
     ) -> Result<()> {
-        // TODO: Not sure if this feature check is neccecery if server_cmd is `AdbServerCommand::Exec(_)`.
-        //       If it isn't move this check to `<ADBServerDevice as ADBDeviceExt>::shell`.
-        let supported_features = self.host_features()?;
-        if !supported_features.contains(&HostFeatures::ShellV2)
-            && !supported_features.contains(&HostFeatures::Cmd)
-        {
-            return Err(RustADBError::ADBShellNotSupported);
-        }
-
+        // For bidirectional session, we still need shell features
+        // But we can try without checking features first
         self.set_serial_transport()?;
         self.transport.send_adb_request(server_cmd)?;
 
         let mut read_stream = self.transport.get_raw_connection()?.try_clone()?;
-
         let mut write_stream = read_stream.try_clone()?;
 
-        // Reading thread, reads response from adb-server
-        std::thread::spawn(move || -> Result<()> {
-            let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
+        // Forward `reader` (that could be stdin e.g) to server socket.
+        // This thread may stay blocked on `reader` forever, so it is never joined.
+        let (local_result_tx, local_result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match std::io::copy(&mut reader, &mut write_stream) {
+                Ok(_) => Ok(()),
+                // Stream has been closed by remote, nothing more to do
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => Ok(()),
+                Err(e) => Err(RustADBError::IOError(e)),
+            };
 
-            loop {
-                match read_stream.read(&mut buffer) {
-                    Ok(0) => {
-                        read_stream.shutdown(std::net::Shutdown::Both)?;
-                        return Ok(());
-                    }
-                    Ok(size) => {
-                        writer.write_all(&buffer[..size])?;
-                        writer.flush()?;
-                    }
-                    Err(e) => {
-                        return Err(RustADBError::IOError(e));
-                    }
-                }
+            // Input is exhausted: half-close the socket so that the server ends the session.
+            let _ = write_stream.shutdown(std::net::Shutdown::Write);
+            if let Err(err) = result {
+                let _ = local_result_tx.send(err);
             }
         });
 
-        // Read from given reader (that could be stdin e.g), and write content to server socket
-        if let Err(e) = std::io::copy(&mut reader, &mut write_stream) {
-            match e.kind() {
-                ErrorKind::BrokenPipe => return Ok(()),
-                _ => return Err(RustADBError::IOError(e)),
+        let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
+        let remote_result = loop {
+            match read_stream.read(&mut buffer) {
+                Ok(0) => break Ok(()),
+                Ok(size) => {
+                    if let Err(e) = writer
+                        .write_all(&buffer[..size])
+                        .and_then(|()| writer.flush())
+                    {
+                        break Err(RustADBError::IOError(e));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => break Err(RustADBError::IOError(e)),
             }
-        }
+        };
 
-        Ok(())
+        // Make any later write from the input thread fail instead of reaching a closed session
+        let _ = read_stream.shutdown(std::net::Shutdown::Both);
+
+        remote_result?;
+
+        // Input thread may still be blocked on `reader`, only report an already known error
+        match local_result_rx.try_recv() {
+            Ok(e) => Err(e),
+            _ => Ok(()),
+        }
     }
 }

@@ -9,6 +9,15 @@ pub enum RustADBError {
     /// Indicates that an error occurred with I/O.
     #[error(transparent)]
     IOError(#[from] std::io::Error),
+    /// Indicates that ADB server cannot be started
+    #[error("cannot start adb server using `{path}`: {source}")]
+    CannotStartServer {
+        /// Path of the `adb` binary used to start the server
+        path: String,
+        /// Underlying error
+        #[source]
+        source: std::io::Error,
+    },
     /// Indicates that an error occurred during ADB shell v2 parsing.
     #[error("ADB shell v2 parsing error: {0}")]
     ADBShellV2ParseError(String),
@@ -18,8 +27,8 @@ pub enum RustADBError {
     /// Indicates that ADB server responded an unknown response type.
     #[error("Unknown response type {0}")]
     UnknownResponseType(String),
-    /// Indicated that an unexpected command has been received
-    #[error("Wrong response command received: {0}. Expected {1}")]
+    /// Indicates that a command different from the expected one was received
+    #[error("wrong response: received {0}, expected {1}")]
     WrongResponseReceived(String, String),
     /// Indicates that ADB server responses an unknown device state.
     #[error("Unknown device state {0}")]
@@ -27,9 +36,9 @@ pub enum RustADBError {
     /// Indicates that an error occurred during UTF-8 parsing.
     #[error(transparent)]
     Utf8StrError(#[from] std::str::Utf8Error),
-    /// Indicates that an error occurred during UTF-8 parsing.
+    /// Indicates that an error occurred during UTF-8 conversion from bytes.
     #[error(transparent)]
-    Utf8StringError(#[from] std::string::FromUtf8Error),
+    Utf8FromBytesError(#[from] std::string::FromUtf8Error),
     /// Indicates that the provided address is not a correct IP address.
     #[error(transparent)]
     AddrParseError(#[from] std::net::AddrParseError),
@@ -61,9 +70,11 @@ pub enum RustADBError {
     #[error("Cannot remount filesystem: {0}")]
     RemountError(String),
     /// An error occurred when getting device's framebuffer image
+    #[cfg(feature = "framebuffer")]
     #[error(transparent)]
     FramebufferImageError(#[from] image::error::ImageError),
     /// An error occurred when converting framebuffer content
+    #[cfg(feature = "framebuffer")]
     #[error("Cannot convert framebuffer into image")]
     FramebufferConversionError,
     /// Unimplemented framebuffer image version
@@ -73,12 +84,12 @@ pub enum RustADBError {
     #[error("Cannot get home directory")]
     NoHomeDirectory,
     /// Generic USB error
-    #[cfg(feature = "usb")]
+    #[cfg(all(feature = "usb", not(target_arch = "wasm32")))]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
     #[error("USB Error: {0}")]
     UsbError(#[from] rusb::Error),
     /// Selected device is busy.
-    #[cfg(feature = "usb")]
+    #[cfg(all(feature = "usb", not(target_arch = "wasm32")))]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
     #[error("Device is busy. Is ADB server running?")]
     DeviceBusy,
@@ -111,21 +122,24 @@ pub enum RustADBError {
     RsaPkcs8Error(#[from] rsa::pkcs8::Error),
     /// Error during certificate generation
     #[error(transparent)]
+    #[cfg(not(target_arch = "wasm32"))]
     CertificateGenerationError(#[from] rcgen::Error),
     /// TLS Error
     #[error(transparent)]
+    #[cfg(not(target_arch = "wasm32"))]
     TLSError(#[from] rustls::Error),
     /// PEM certificate error
     #[error(transparent)]
+    #[cfg(not(target_arch = "wasm32"))]
     PemCertError(#[from] rustls_pki_types::pem::Error),
-    /// Error while locking mutex
-    #[error("error while locking data")]
+    /// Error while locking a mutex (the mutex was poisoned)
+    #[error("mutex was poisoned")]
     PoisonError,
     /// Cannot upgrade connection from TCP to TLS
     #[error("upgrade error: {0}")]
     UpgradeError(String),
     /// An error occurred while getting mdns devices
-    #[cfg(feature = "mdns")]
+    #[cfg(all(feature = "mdns", not(target_arch = "wasm32")))]
     #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
     #[error(transparent)]
     MDNSError(#[from] mdns_sd::Error),
@@ -138,6 +152,12 @@ pub enum RustADBError {
     /// An unknown file mode was encountered in list
     #[error("Unknown file mode {0}")]
     UnknownFileMode(u32),
+    /// An error occured while parsing a date
+    #[error(transparent)]
+    ParseDateError(#[from] chrono::ParseError),
+    /// An error occurred while parsing a stat extended response
+    #[error("stat response error: {0}")]
+    StatResponseError(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for RustADBError {

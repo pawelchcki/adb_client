@@ -19,16 +19,21 @@ impl Display for ADBCommand {
     }
 }
 
-#[test]
-fn test_pair_command() {
-    let host = "192.168.0.197:34783";
-    let code = "091102";
-    let code_u32 = code.parse::<u32>().expect("cannot parse u32");
-    let pair = ADBCommand::Host(ADBHostCommand::Pair(
-        host.parse().expect("cannot parse host"),
-        code.into(),
-    ));
+#[cfg(test)]
+mod tests {
+    use crate::models::{ADBCommand, ADBHostCommand};
 
-    assert_eq!(pair.to_string(), format!("host:pair:{code}:{host}"));
-    assert_ne!(pair.to_string(), format!("host:pair:{code_u32}:{host}"));
+    #[test]
+    fn test_pair_command() {
+        let host = "192.168.0.197:34783";
+        let code = "091102";
+        let code_u32 = code.parse::<u32>().expect("cannot parse u32");
+        let pair = ADBCommand::Host(ADBHostCommand::Pair(
+            host.parse().expect("cannot parse host"),
+            code.into(),
+        ));
+
+        assert_eq!(pair.to_string(), format!("host:pair:{code}:{host}"));
+        assert_ne!(pair.to_string(), format!("host:pair:{code_u32}:{host}"));
+    }
 }

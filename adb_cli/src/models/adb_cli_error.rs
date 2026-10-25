@@ -47,7 +47,7 @@ impl From<adb_client::RustADBError> for ADBCliError {
             | RustADBError::ADBRequestFailed(_)
             | RustADBError::UnknownDeviceState(_)
             | RustADBError::Utf8StrError(_)
-            | RustADBError::Utf8StringError(_)
+            | RustADBError::Utf8FromBytesError(_)
             | RustADBError::RegexError(_)
             | RustADBError::ParseIntError(_)
             | RustADBError::ConversionError
@@ -69,7 +69,9 @@ impl From<adb_client::RustADBError> for ADBCliError {
             | RustADBError::SendError
             | RustADBError::UnknownFileMode(_)
             | RustADBError::UnknownTransport(_)
-            | RustADBError::RemountError(_) => Self::MayNeedAnIssue(value),
+            | RustADBError::RemountError(_)
+            | RustADBError::StatResponseError(_)
+            | RustADBError::ParseDateError(_) => Self::MayNeedAnIssue(value),
             // List of [`RustADBError`] that may occur in standard contexts and therefore do not require for issues
             RustADBError::ADBDeviceNotPaired
             | RustADBError::UnknownResponseType(_)
@@ -79,7 +81,8 @@ impl From<adb_client::RustADBError> for ADBCliError {
             | RustADBError::USBDeviceNotFound(_, _)
             | RustADBError::WrongFileExtension(_)
             | RustADBError::AddrParseError(_)
-            | RustADBError::DeviceBusy => Self::Standard(value),
+            | RustADBError::DeviceBusy
+            | RustADBError::CannotStartServer { .. } => Self::Standard(value),
         }
     }
 }

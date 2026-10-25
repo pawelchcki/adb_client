@@ -40,12 +40,12 @@ fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) -> AD
                 {
                     let adb_termios = ADBTermios::new(&std::io::stdin())?;
                     adb_termios.set_adb_termios()?;
-                    device.shell(&mut std::io::stdin(), Box::new(std::io::stdout()))?;
+                    device.shell(Box::new(std::io::stdin()), Box::new(std::io::stdout()))?;
                 }
 
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
-                    device.shell(&mut std::io::stdin(), Box::new(std::io::stdout()))?;
+                    device.shell(Box::new(std::io::stdin()), Box::new(std::io::stdout()))?;
                 }
             } else {
                 device.shell_command(&commands.join(" "), Some(&mut std::io::stdout()), None)?;
@@ -62,6 +62,14 @@ fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) -> AD
         DeviceCommands::Stat { path } => {
             let stat_response = device.stat(&path)?;
             println!("{stat_response}");
+        }
+        DeviceCommands::StatExtended { path } => {
+            let stat_response = device.stat_extended(&path)?;
+            if let Some(stat_response) = stat_response {
+                println!("{stat_response}");
+            } else {
+                println!("No such file or directory");
+            }
         }
         DeviceCommands::Reboot { reboot_type } => {
             log::info!("Reboots device in mode {reboot_type:?}");
@@ -125,15 +133,17 @@ fn inner_main() -> ADBCliResult<()> {
         MainCommand::Host(server_command) => return Ok(handle_host_commands(server_command)?),
         MainCommand::Emu(emulator_command) => return handle_emulator_commands(emulator_command),
         MainCommand::Local(server_command) => {
-            // Must start server to communicate with device, but only if this is a local one.
-            let server_address_ip = server_command.address.ip();
-            if server_address_ip.is_loopback() || server_address_ip.is_unspecified() {
-                ADBServer::start(&HashMap::default(), &None);
+            // Must start server to communicate with device, but only if this is a local one not already running.
+            if ADBServer::new(server_command.address).should_start_server() {
+                ADBServer::start(&HashMap::default(), None)?;
             }
 
-            let device = match server_command.serial {
-                Some(serial) => ADBServerDevice::new(serial, Some(server_command.address)),
-                None => ADBServerDevice::autodetect(Some(server_command.address)),
+            let device = if let Some(id) = server_command.transport_id {
+                ADBServerDevice::new_with_transport_id(id, Some(server_command.address))
+            } else if let Some(serial) = server_command.serial {
+                ADBServerDevice::new(serial, Some(server_command.address))
+            } else {
+                ADBServerDevice::autodetect(Some(server_command.address))
             };
 
             match server_command.command {
@@ -218,10 +228,6 @@ fn inner_main() -> ADBCliResult<()> {
             }
 
             return Ok(service.shutdown()?);
-        }
-        MainCommand::Version => {
-            println!("{} {}", env!("CARGO_PKG_NAME"), utils::long_version());
-            return Ok(());
         }
     };
 

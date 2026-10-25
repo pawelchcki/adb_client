@@ -9,6 +9,10 @@ pub const AUTH_TOKEN: u32 = 1;
 pub const AUTH_SIGNATURE: u32 = 2;
 pub const AUTH_RSAPUBLICKEY: u32 = 3;
 
+/// Maximum message payload size we accept, announced in our `CNXN` message.
+/// Defaults to 1MB.
+pub const MAX_PAYLOAD_SIZE: u32 = 1024 * 1024;
+
 #[derive(Debug)]
 pub struct ADBTransportMessage {
     header: ADBTransportMessageHeader,
@@ -16,7 +20,6 @@ pub struct ADBTransportMessage {
 }
 
 #[derive(Debug)]
-#[repr(C)]
 pub struct ADBTransportMessageHeader {
     command: MessageCommand, /* command identifier constant      */
     arg0: u32,               /* first argument                   */
@@ -142,7 +145,7 @@ impl ADBTransportMessage {
         &self.header
     }
 
-    pub const fn payload(&self) -> &Vec<u8> {
+    pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 
@@ -155,6 +158,31 @@ impl TryFrom<[u8; 24]> for ADBTransportMessageHeader {
     type Error = RustADBError;
 
     fn try_from(value: [u8; 24]) -> Result<Self> {
-        Self::decode(&value)
+        let header = Self::decode(&value)?;
+
+        // Received headers are trusted for the payload allocation, a size we never accepted must be refused
+        if header.data_length > MAX_PAYLOAD_SIZE {
+            return Err(RustADBError::ADBRequestFailed(format!(
+                "received message payload of {} bytes, more than the maximum of {MAX_PAYLOAD_SIZE}",
+                header.data_length
+            )));
+        }
+
+        Ok(header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_error_identifies_received_before_expected() {
+        let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]).unwrap();
+        let error = message.assert_command(MessageCommand::Okay).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "wrong response: received CLSE, expected OKAY"
+        );
     }
 }

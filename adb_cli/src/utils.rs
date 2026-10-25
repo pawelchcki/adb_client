@@ -7,7 +7,3 @@ pub fn setup_logger(debug: bool) {
     Builder::from_env(Env::default().default_filter_or(if debug { "debug" } else { "info" }))
         .init();
 }
-
-pub const fn long_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}

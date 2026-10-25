@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![forbid(missing_debug_implementations)]
 #![forbid(missing_docs)]
+#![allow(clippy::missing_errors_doc)]
 #![doc = include_str!("../README.md")]
 // Feature `doc_cfg` is currently only available on nightly builds.
 // It is activated when cfg `docsrs` is enabled.
@@ -25,7 +26,7 @@ pub mod server_device;
 mod utils;
 
 /// MDNS-related definitions
-#[cfg(feature = "mdns")]
+#[cfg(all(feature = "mdns", not(target_arch = "wasm32")))]
 #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
 pub mod mdns;
 
@@ -33,4 +34,7 @@ pub use adb_device_ext::ADBDeviceExt;
 use adb_transport::ADBTransport;
 pub use error::{Result, RustADBError};
 pub use message_devices::*;
-pub use models::{ADBListItem, ADBListItemType, AdbStatResponse, HostFeatures, RebootType};
+pub use models::{
+    ADBListItem, ADBListItemType, ADBStatExtendedResponse, ADBStatMapping, AdbStatResponse,
+    HostFeatures, RebootType, RemountInfo,
+};

@@ -22,7 +22,7 @@ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
     }
 
     #[inline]
-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
+    fn shell(&mut self, reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Result<()> {
         self.shell(reader, writer)
     }
 
@@ -30,7 +30,7 @@ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
     fn exec(
         &mut self,
         command: &str,
-        reader: &mut dyn Read,
+        reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
     ) -> Result<()> {
         self.exec(command, reader, writer)
@@ -87,6 +87,7 @@ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
     }
 
     #[inline]
+    #[cfg(feature = "framebuffer")]
     fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
         self.framebuffer_inner()
     }

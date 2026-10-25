@@ -17,6 +17,8 @@ use crate::utils::get_default_adb_key_path;
 #[derive(Debug)]
 pub struct ADBUSBDevice {
     inner: ADBMessageDevice<USBTransport>,
+    vendor_id: u16,
+    product_id: u16,
 }
 
 impl ADBUSBDevice {
@@ -51,17 +53,42 @@ impl ADBUSBDevice {
         transport: USBTransport,
         private_key_path: P,
     ) -> Result<Self> {
+        let vendor_id = transport.vendor_id()?;
+        let product_id = transport.product_id()?;
+
         Ok(Self {
             inner: ADBMessageDevice::new(transport, private_key_path)?,
+            vendor_id,
+            product_id,
         })
     }
 
-    /// autodetect connected ADB devices and establish a connection with the first device found
+    /// Returns the vendor ID of the device
+    #[must_use]
+    pub const fn vendor_id(&self) -> u16 {
+        self.vendor_id
+    }
+
+    /// Returns the product ID of the device
+    #[must_use]
+    pub const fn product_id(&self) -> u16 {
+        self.product_id
+    }
+
+    /// Autodetect connected ADB devices and establish a connection with the first device found
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if multiple devices or none are connected.
     pub fn autodetect() -> Result<Self> {
         Self::autodetect_with_custom_private_key(get_default_adb_key_path()?)
     }
 
-    /// autodetect connected ADB devices and establish a connection with the first device found using a custom private key path
+    /// Autodetect connected ADB devices and establish a connection with the first device found using a custom private key path
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if multiple devices are connected or if none can be detected.
     pub fn autodetect_with_custom_private_key(private_key_path: PathBuf) -> Result<Self> {
         match utils::get_single_connected_adb_device()? {
             Some(device_info) => Self::new_with_custom_private_key(
@@ -88,7 +115,7 @@ impl ADBDeviceExt for ADBUSBDevice {
     }
 
     #[inline]
-    fn shell<'a>(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
+    fn shell(&mut self, reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Result<()> {
         self.inner.shell(reader, writer)
     }
 
@@ -143,6 +170,7 @@ impl ADBDeviceExt for ADBUSBDevice {
     }
 
     #[inline]
+    #[cfg(feature = "framebuffer")]
     fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
         self.inner.framebuffer_inner()
     }
@@ -156,7 +184,7 @@ impl ADBDeviceExt for ADBUSBDevice {
     fn exec(
         &mut self,
         command: &str,
-        reader: &mut dyn Read,
+        reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
     ) -> Result<()> {
         self.inner.exec(command, reader, writer)

@@ -1,5 +1,4 @@
 mod forward;
-mod framebuffer;
 mod host_features;
 mod install;
 mod list;
@@ -12,8 +11,14 @@ mod reverse;
 mod root;
 mod send;
 mod stat;
+mod sync;
 mod tcpip;
 mod transport;
 mod uninstall;
 mod usb;
 mod verity;
+
+pub use sync::ADBSyncSession;
+
+#[cfg(feature = "framebuffer")]
+mod framebuffer;

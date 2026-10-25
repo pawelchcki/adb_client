@@ -1,5 +1,5 @@
 [workspace]
-members = ["adb_cli", "adb_client", "examples/mdns", "pyadb_client"]
+members = ["adb_cli", "adb_client", "examples/mdns", "examples/webusb", "pyadb_client"]
 resolver = "2"
 
 [workspace.package]
@@ -9,15 +9,14 @@ homepage = "https://github.com/cocool97/adb_client"
 keywords = ["adb", "android", "tcp", "usb"]
 license = "MIT"
 repository = "https://github.com/cocool97/adb_client"
-version = "3.1.1"
-rust-version = "1.91.0"
+version = "3.2.3"
+rust-version = "1.90.0"
 
-# To build locally when working on a new release
+# To build locally when working on new features
 [patch.crates-io]
 adb_client = { path = "./adb_client" }
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 
 [profile.release]
