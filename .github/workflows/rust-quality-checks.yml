@@ -1,0 +1,56 @@
+# Preserve the upstream quality jobs, with dependency reporting kept independent
+# of whether all newest major versions can resolve in one hypothetical graph.
+name: Rust quality checks
+
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cocool97/action_templates/.github/actions/rust-setup@main
+      - uses: actions/checkout@v4
+      - uses: cocool97/action_templates/.github/actions/rust-clippy@main
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cocool97/action_templates/.github/actions/rust-setup@main
+      - uses: actions/checkout@v4
+      - uses: cocool97/action_templates/.github/actions/rust-fmt@main
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cocool97/action_templates/.github/actions/rust-setup@main
+      - uses: actions/checkout@v4
+      - uses: cocool97/action_templates/.github/actions/rust-msrv@main
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cocool97/action_templates/.github/actions/rust-setup@main
+      - uses: actions/checkout@v4
+      - uses: cocool97/action_templates/.github/actions/rust-doc@main
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cocool97/action_templates/.github/actions/rust-setup@main
+      - uses: actions/checkout@v4
+      - uses: cocool97/action_templates/.github/actions/rust-test@main
+      - name: Test policy helper
+        run: python3 -m unittest discover -s tools -p "*_test.py"
+  outdated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cocool97/action_templates/.github/actions/rust-setup@main
+      - uses: actions/checkout@v4
+      - name: Report dependency versions
+        run: python3 tools/report-dependency-updates.py
+  unused:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cocool97/action_templates/.github/actions/rust-setup@main
+      - uses: actions/checkout@v4
+      - uses: cocool97/action_templates/.github/actions/rust-unused@main
