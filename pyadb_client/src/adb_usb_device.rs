@@ -13,6 +13,47 @@ pub struct PyADBUSBDevice(ADBUSBDevice);
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyADBUSBDevice {
+    /// Read raw command output without terminal byte transformations.
+    pub fn exec_out<'py>(&mut self, py: Python<'py>, command: &str) -> Result<Bound<'py, PyBytes>> {
+        let mut output = Vec::new();
+        self.0.exec_out(command, &mut output)?;
+        Ok(PyBytes::new(py, &output))
+    }
+
+    /// Capture PNG screenshot bytes using Android screencap.
+    pub fn screenshot_png<'py>(&mut self, py: Python<'py>) -> Result<Bound<'py, PyBytes>> {
+        let mut output = Vec::new();
+        self.0.screenshot_png(&mut output)?;
+        Ok(PyBytes::new(py, &output))
+    }
+
+    /// Tap at device screen coordinates.
+    pub fn tap(&mut self, x: u32, y: u32) -> Result<()> {
+        Ok(self.0.tap(x, y)?)
+    }
+
+    /// List all, system or third-party packages for the current or given user.
+    #[pyo3(signature = (filter="all", user=None))]
+    pub fn list_packages(&mut self, filter: &str, user: Option<u32>) -> Result<Vec<String>> {
+        let filter = match filter {
+            "all" => adb_client::PackageFilter::All,
+            "system" => adb_client::PackageFilter::System,
+            "third-party" => adb_client::PackageFilter::ThirdParty,
+            _ => anyhow::bail!("filter must be all, system or third-party"),
+        };
+        Ok(self.0.list_packages(filter, user)?)
+    }
+
+    /// Set command I/O idle timeouts in milliseconds; None means unlimited.
+    #[pyo3(signature = (read_ms=None, write_ms=Some(2000)))]
+    pub fn set_timeouts(&mut self, read_ms: Option<u64>, write_ms: Option<u64>) -> Result<()> {
+        Ok(self.0.set_timeouts(adb_client::ADBTimeouts {
+            read: read_ms.map(std::time::Duration::from_millis),
+            write: write_ms.map(std::time::Duration::from_millis),
+            ..adb_client::ADBTimeouts::default()
+        })?)
+    }
+
     #[staticmethod]
     /// Autodetect a device reachable over USB.
     /// This method raises an error if multiple devices or none are connected.

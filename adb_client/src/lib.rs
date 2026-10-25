@@ -17,10 +17,22 @@ pub mod emulator;
 mod error;
 mod message_devices;
 mod models;
+mod package_filter;
+pub use package_filter::PackageFilter;
+mod timeouts;
+pub use timeouts::ADBTimeouts;
 
 /// Server-related definitions
 pub mod server;
 
+/// Tokio-native smart-socket clients and cancellable streaming service readers.
+#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+pub mod asynchronous;
+/// Direct Android wireless pairing without an ADB server or executable.
+#[cfg(all(feature = "pairing", not(target_arch = "wasm32")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "pairing")))]
+pub mod pairing;
 /// Device reachable by the server related definitions
 pub mod server_device;
 mod utils;

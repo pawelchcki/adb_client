@@ -86,7 +86,10 @@ fn serve(stream: &mut dyn Duplex, prefix: &mpsc::Sender<()>) {
     stream.flush().unwrap();
 }
 
-fn fixture(tls: bool) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyFile>) {
+fn fixture(
+    tls: bool,
+    legacy_key: bool,
+) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyFile>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let config = tls.then(|| {
@@ -123,6 +126,14 @@ fn fixture(tls: bool) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyF
         serve(&mut *stream, &prefix_tx);
     });
     let key = tls.then(key_file);
+    if legacy_key {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::pkcs8::DecodePrivateKey;
+        let path = &key.as_ref().unwrap().0;
+        let key =
+            rsa::RsaPrivateKey::from_pkcs8_pem(&std::fs::read_to_string(path).unwrap()).unwrap();
+        std::fs::write(path, key.to_pkcs1_pem(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    }
     let path = key.as_ref().map_or_else(PathBuf::new, |key| key.0.clone());
     let mut transport = TcpTransport::new(address, path);
     transport.connect().unwrap();
@@ -133,8 +144,8 @@ fn fixture(tls: bool) -> (TcpTransport, std::thread::JoinHandle<()>, Option<KeyF
     (transport, peer, key)
 }
 
-fn exercise_duplex(tls: bool) {
-    let (mut transport, peer, _key) = fixture(tls);
+fn exercise_duplex(tls: bool, legacy_key: bool) {
+    let (mut transport, peer, _key) = fixture(tls, legacy_key);
     let mut reader = transport.clone();
     let (started_tx, started_rx) = mpsc::channel();
     let receive = std::thread::spawn(move || {
@@ -176,10 +187,190 @@ fn exercise_duplex(tls: bool) {
 
 #[test]
 fn plaintext_reader_does_not_block_writers_or_interleave_packets() {
-    exercise_duplex(false);
+    exercise_duplex(false, false);
 }
 
 #[test]
 fn tls_reader_does_not_block_writers_or_interleave_packets() {
-    exercise_duplex(true);
+    exercise_duplex(true, false);
+}
+
+#[test]
+fn native_handshake_timeout_does_not_wait_for_the_default_read_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, wait) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Cnxn
+        );
+        let _ = wait.recv_timeout(Duration::from_secs(3));
+    });
+    let key = key_file();
+    let error = crate::tcp::ADBTcpDevice::new_with_custom_private_key_and_timeouts(
+        address,
+        &key.0,
+        crate::ADBTimeouts {
+            handshake: Some(Duration::from_millis(50)),
+            ..crate::ADBTimeouts::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+    release.send(()).unwrap();
+    peer.join().unwrap();
+}
+
+#[test]
+fn tls_accepts_a_legacy_adb_pkcs1_identity_without_rewriting_it() {
+    exercise_duplex(true, true);
+}
+
+#[test]
+fn tls_upgrade_obeys_the_remaining_handshake_deadline_with_trickled_records() {
+    let key = key_file();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (started, observed) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Cnxn
+        );
+        started.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        stream
+            .write_all(
+                &ADBTransportMessage::try_new(MessageCommand::Stls, 1, 0, &[])
+                    .unwrap()
+                    .header()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Stls
+        );
+        // An incomplete TLS record makes rustls continue reading without
+        // generating a protocol error or extending the overall deadline.
+        let _ = stream.write_all(&[0x16, 0x03, 0x03, 0x00, 100]);
+        while wait.recv_timeout(Duration::from_millis(50)).is_err() {
+            if stream.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+    });
+    let (done, result) = mpsc::channel();
+    let client = std::thread::spawn(move || {
+        done.send(
+            crate::tcp::ADBTcpDevice::new_with_custom_private_key_and_timeouts(
+                address,
+                &key.0,
+                crate::ADBTimeouts {
+                    handshake: Some(Duration::from_secs(1)),
+                    ..crate::ADBTimeouts::default()
+                },
+            )
+            .map(|_| ()),
+        )
+        .unwrap();
+    });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let completed = result.recv_timeout(Duration::from_millis(1300));
+    let _ = release.send(());
+    peer.join().unwrap();
+    client.join().unwrap();
+    let error = completed
+        .expect("TLS upgrade exceeded the total handshake deadline")
+        .unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+}
+
+#[test]
+fn trickled_adb_handshake_packet_cannot_extend_the_deadline() {
+    let key = key_file();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Cnxn
+        );
+        let reply =
+            ADBTransportMessage::try_new(MessageCommand::Cnxn, 0x0100_0000, 4096, b"device::\0")
+                .unwrap();
+        let mut bytes = reply.header().as_bytes();
+        bytes.extend_from_slice(reply.payload());
+        for byte in bytes {
+            std::thread::sleep(Duration::from_millis(50));
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+        }
+    });
+    let result = crate::tcp::ADBTcpDevice::new_with_custom_private_key_and_timeouts(
+        address,
+        &key.0,
+        crate::ADBTimeouts {
+            handshake: Some(Duration::from_secs(1)),
+            ..crate::ADBTimeouts::default()
+        },
+    );
+    peer.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+}
+
+#[test]
+fn tls_partial_adb_packet_resumes_after_an_idle_timeout() {
+    let (mut transport, peer, _key) = fixture(true, false);
+    let error = transport
+        .read_message_with_timeout(Duration::from_millis(50))
+        .unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+    for tag in b"ab" {
+        transport
+            .write_message_with_timeout(
+                ADBTransportMessage::try_new(MessageCommand::Write, 1, 7, &vec![*tag; 128 * 1024])
+                    .unwrap(),
+                Duration::from_secs(3),
+            )
+            .unwrap();
+    }
+    let resumed = transport.read_message_with_timeout(Duration::from_secs(3));
+    let close = resumed
+        .as_ref()
+        .ok()
+        .map(|_| transport.read_message_with_timeout(Duration::from_secs(3)));
+    let served = peer.join();
+    transport.disconnect().unwrap();
+    let resumed = resumed.expect("TLS state was corrupted by a recoverable timeout");
+    assert_eq!(
+        close.unwrap().unwrap().header().command(),
+        MessageCommand::Clse
+    );
+    served.unwrap();
+    assert_eq!(resumed.payload(), vec![b'r'; 128 * 1024]);
 }

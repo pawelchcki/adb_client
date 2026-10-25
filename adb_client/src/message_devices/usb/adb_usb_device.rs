@@ -22,6 +22,32 @@ pub struct ADBUSBDevice {
 }
 
 impl ADBUSBDevice {
+    /// Transfer this connection to a multiplexed native forwarding controller.
+    /// Run ordinary device commands before converting; the controller owns all packet reads.
+    #[must_use]
+    pub fn into_forwarder(mut self) -> crate::ADBForwarder {
+        let timeouts = self.inner.get_transport_mut().timeouts();
+        self.inner.into_forwarder(timeouts)
+    }
+
+    /// Start daemon-free host TCP forwarding and return its owning controller.
+    pub fn forward(self, local: std::net::SocketAddr, remote: &str) -> Result<crate::ADBForwarder> {
+        let mut controller = self.into_forwarder();
+        controller.forward(local, remote)?;
+        Ok(controller)
+    }
+
+    /// Start daemon-free device TCP reverse forwarding and return its controller.
+    pub fn reverse(
+        self,
+        remote_port: u16,
+        local: std::net::SocketAddr,
+    ) -> Result<crate::ADBForwarder> {
+        let mut controller = self.into_forwarder();
+        controller.reverse(remote_port, local)?;
+        Ok(controller)
+    }
+
     /// Instantiate a new [`ADBUSBDevice`]
     pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
         Self::new_with_custom_private_key(vendor_id, product_id, get_default_adb_key_path()?)
@@ -56,11 +82,44 @@ impl ADBUSBDevice {
         let vendor_id = transport.vendor_id()?;
         let product_id = transport.product_id()?;
 
+        let handshake = transport.timeouts().handshake;
         Ok(Self {
-            inner: ADBMessageDevice::new(transport, private_key_path)?,
+            inner: ADBMessageDevice::new_with_handshake_timeout(
+                transport,
+                private_key_path,
+                handshake,
+            )?,
             vendor_id,
             product_id,
         })
+    }
+
+    /// Connect to a USB device with explicit handshake and command I/O timeouts.
+    pub fn new_with_timeouts(
+        vendor_id: u16,
+        product_id: u16,
+        timeouts: crate::ADBTimeouts,
+    ) -> Result<Self> {
+        let mut transport = USBTransport::new(vendor_id, product_id)?;
+        transport.set_timeouts(timeouts)?;
+        Self::new_from_transport(transport, None)
+    }
+
+    /// Connect using a custom key and explicit handshake and command I/O timeouts.
+    pub fn new_with_custom_private_key_and_timeouts<P: AsRef<Path>>(
+        vendor_id: u16,
+        product_id: u16,
+        private_key_path: P,
+        timeouts: crate::ADBTimeouts,
+    ) -> Result<Self> {
+        let mut transport = USBTransport::new(vendor_id, product_id)?;
+        transport.set_timeouts(timeouts)?;
+        Self::new_from_transport_inner(transport, private_key_path)
+    }
+
+    /// Change subsequent command I/O timeouts on this connection.
+    pub fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        self.inner.get_transport_mut().set_timeouts(timeouts)
     }
 
     /// Returns the vendor ID of the device
@@ -104,6 +163,10 @@ impl ADBUSBDevice {
 }
 
 impl ADBDeviceExt for ADBUSBDevice {
+    fn exec_out(&mut self, command: &str, output: &mut dyn Write) -> Result<()> {
+        self.inner.exec_out(command, output)
+    }
+
     #[inline]
     fn shell_command(
         &mut self,

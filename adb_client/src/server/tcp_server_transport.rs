@@ -14,6 +14,7 @@ const DEFAULT_SERVER_PORT: u16 = 5037;
 pub struct TCPServerTransport {
     socket_addr: SocketAddrV4,
     tcp_stream: Option<TcpStream>,
+    timeouts: crate::ADBTimeouts,
 }
 
 impl Default for TCPServerTransport {
@@ -29,6 +30,10 @@ impl TCPServerTransport {
         Self {
             socket_addr,
             tcp_stream: None,
+            timeouts: crate::ADBTimeouts {
+                write: None,
+                ..crate::ADBTimeouts::DEFAULT
+            },
         }
     }
 
@@ -42,6 +47,17 @@ impl TCPServerTransport {
     #[must_use]
     pub const fn get_socketaddr(&self) -> SocketAddrV4 {
         self.socket_addr
+    }
+
+    /// Configure connection and command I/O timeouts, including an existing socket.
+    pub fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        let timeouts = timeouts.validate()?;
+        if let Some(stream) = &self.tcp_stream {
+            stream.set_read_timeout(timeouts.read)?;
+            stream.set_write_timeout(timeouts.write)?;
+        }
+        self.timeouts = timeouts;
+        Ok(())
     }
 
     pub(crate) fn proxy_connection(
@@ -98,11 +114,25 @@ impl TCPServerTransport {
     /// Send the given [`AdbCommand`] to ADB server, and checks that the request has been taken in consideration.
     /// If an error occurred, a [`RustADBError`] is returned with the response error string.
     pub(crate) fn send_adb_request(&self, command: &ADBCommand) -> Result<()> {
-        let adb_command_string = command.to_string();
-        let adb_request = format!("{:04x}{}", adb_command_string.len(), adb_command_string);
+        self.send_service_request(&command.to_string())
+    }
 
-        self.get_raw_connection()?
-            .write_all(adb_request.as_bytes())?;
+    pub(crate) fn take_connection(&mut self) -> Result<TcpStream> {
+        self.tcp_stream
+            .take()
+            .ok_or_else(|| Error::from(ErrorKind::NotConnected).into())
+    }
+
+    pub(crate) fn send_service_request(&self, service: &str) -> Result<()> {
+        if service.len() > 0xffff || service.contains('\0') {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "ADB service must be at most 65535 bytes and contain no NUL",
+            )
+            .into());
+        }
+        let request = format!("{:04x}{service}", service.len());
+        self.get_raw_connection()?.write_all(request.as_bytes())?;
 
         self.read_adb_response()
     }
@@ -150,7 +180,12 @@ impl ADBTransport for TCPServerTransport {
             // Ignoring underlying error, we will recreate a new connection
             let _ = previous.shutdown(std::net::Shutdown::Both);
         }
-        let tcp_stream = TcpStream::connect(self.socket_addr)?;
+        let tcp_stream = match self.timeouts.handshake {
+            Some(timeout) => TcpStream::connect_timeout(&self.socket_addr.into(), timeout)?,
+            None => TcpStream::connect(self.socket_addr)?,
+        };
+        tcp_stream.set_read_timeout(self.timeouts.read)?;
+        tcp_stream.set_write_timeout(self.timeouts.write)?;
         tcp_stream.set_nodelay(true)?;
         self.tcp_stream = Some(tcp_stream);
         log::trace!("Successfully connected to {}", self.socket_addr);

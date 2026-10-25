@@ -11,6 +11,10 @@ use std::{
 };
 
 impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
+    fn exec_out(&mut self, command: &str, output: &mut dyn Write) -> Result<()> {
+        self.exec_out(command, output)
+    }
+
     #[inline]
     fn shell_command(
         &mut self,

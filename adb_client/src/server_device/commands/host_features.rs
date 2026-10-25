@@ -19,11 +19,18 @@ impl ADBServerDevice {
             return Ok(cached.features.clone());
         }
 
-        self.set_serial_transport()?;
+        let command = if let Some(id) = self.transport_id {
+            ADBHostCommand::TransportFeatures(id)
+        } else if let Some(serial) = &self.identifier {
+            ADBHostCommand::DeviceFeatures(serial.clone())
+        } else {
+            ADBHostCommand::HostFeatures
+        };
+        self.connect()?;
 
         let features: Vec<HostFeatures> = self
             .transport
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::HostFeatures), true)?
+            .proxy_connection(&ADBCommand::Host(command), true)?
             .split(|x| x.eq(&b','))
             .filter_map(|v| match HostFeatures::try_from(v) {
                 Ok(feature) => Some(feature),

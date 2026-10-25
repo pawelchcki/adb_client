@@ -1,17 +1,16 @@
-use std::{sync::Arc, time::Duration};
-
-use rusb::{
-    Context, Device, DeviceHandle, Direction, TransferType, UsbContext,
-    constants::LIBUSB_CLASS_VENDOR_SPEC,
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+
+use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
 use crate::{
     Result, RustADBError,
     adb_transport::ADBTransport,
     message_devices::{
-        adb_message_transport::ADBMessageTransport,
-        adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
-        message_commands::MessageCommand,
+        adb_message_transport::ADBMessageTransport, adb_transport_message::ADBTransportMessage,
+        packet_reader::PacketReader,
     },
 };
 
@@ -20,12 +19,16 @@ struct Endpoint {
     iface: u8,
     address: u8,
     max_packet_size: usize,
+    setting: u8,
 }
 
 /// Transport running on USB
 #[derive(Debug, Clone)]
 pub struct USBTransport {
     device: Device<Context>,
+    timeouts: crate::ADBTimeouts,
+    receive: Option<Arc<Mutex<PacketReader>>>,
+    send: Option<Arc<Mutex<()>>>,
     handle: Option<Arc<DeviceHandle<Context>>>,
     read_endpoint: Option<Endpoint>,
     write_endpoint: Option<Endpoint>,
@@ -57,10 +60,23 @@ impl USBTransport {
     pub const fn new_from_device(rusb_device: rusb::Device<Context>) -> Self {
         Self {
             device: rusb_device,
+            timeouts: crate::ADBTimeouts::DEFAULT,
+            receive: None,
+            send: None,
             handle: None,
             read_endpoint: None,
             write_endpoint: None,
         }
+    }
+
+    /// Set handshake and command I/O timeouts before connecting, or for future operations.
+    pub fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        self.timeouts = timeouts.validate()?;
+        Ok(())
+    }
+
+    pub(crate) const fn timeouts(&self) -> crate::ADBTimeouts {
+        self.timeouts
     }
 
     pub(crate) fn vendor_id(&self) -> Result<u16> {
@@ -110,9 +126,6 @@ impl USBTransport {
     }
 
     fn find_endpoints(handle: &DeviceHandle<Context>) -> Result<(Endpoint, Endpoint)> {
-        let mut read_endpoint: Option<Endpoint> = None;
-        let mut write_endpoint: Option<Endpoint> = None;
-
         for n in 0..handle.device().device_descriptor()?.num_configurations() {
             let Ok(config_desc) = handle.device().config_descriptor(n) else {
                 continue;
@@ -120,14 +133,19 @@ impl USBTransport {
 
             for interface in config_desc.interfaces() {
                 for interface_desc in interface.descriptors() {
+                    let mut read_endpoint: Option<Endpoint> = None;
+                    let mut write_endpoint: Option<Endpoint> = None;
                     for endpoint_desc in interface_desc.endpoint_descriptors() {
                         if endpoint_desc.transfer_type() == TransferType::Bulk
-                            && interface_desc.class_code() == LIBUSB_CLASS_VENDOR_SPEC
-                            && interface_desc.sub_class_code() == 0x42
-                            && interface_desc.protocol_code() == 0x01
+                            && super::utils::is_adb_interface(
+                                interface_desc.class_code(),
+                                interface_desc.sub_class_code(),
+                                interface_desc.protocol_code(),
+                            )
                         {
                             let endpoint = Endpoint {
                                 iface: interface_desc.interface_number(),
+                                setting: interface_desc.setting_number(),
                                 address: endpoint_desc.address(),
                                 max_packet_size: endpoint_desc.max_packet_size() as usize,
                             };
@@ -163,6 +181,9 @@ impl USBTransport {
         let data_len = data.len();
         while offset < data_len {
             let write_amount = handle.write_bulk(endpoint.address, &data[offset..], timeout)?;
+            if write_amount == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
             offset += write_amount;
 
             log::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
@@ -185,12 +206,19 @@ impl ADBTransport for USBTransport {
 
         Self::configure_endpoint(&device, &read_endpoint)?;
         log::debug!("got read endpoint: {read_endpoint:?}");
-        self.read_endpoint = Some(read_endpoint);
+        self.read_endpoint = Some(read_endpoint.clone());
 
-        Self::configure_endpoint(&device, &write_endpoint)?;
+        if write_endpoint.iface != read_endpoint.iface {
+            Self::configure_endpoint(&device, &write_endpoint)?;
+        }
+        if read_endpoint.setting != 0 {
+            device.set_alternate_setting(read_endpoint.iface, read_endpoint.setting)?;
+        }
         log::debug!("got write endpoint: {write_endpoint:?}");
         self.write_endpoint = Some(write_endpoint);
 
+        self.receive = Some(Arc::default());
+        self.send = Some(Arc::default());
         self.handle = Some(Arc::new(device));
 
         Ok(())
@@ -202,11 +230,8 @@ impl ADBTransport for USBTransport {
             return Ok(());
         }
 
-        let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])?;
-        if let Err(e) = self.write_message(message) {
-            log::error!("error while sending CLSE message: {e}");
-        }
-
+        // Release without taking the packet-send mutex: disconnect must also
+        // interrupt a transfer configured with an unlimited write timeout.
         if let Some(handle) = &self.handle {
             let endpoint = self.read_endpoint.as_ref().or(self.write_endpoint.as_ref());
             if let Some(endpoint) = &endpoint {
@@ -222,19 +247,46 @@ impl ADBTransport for USBTransport {
 }
 
 impl ADBMessageTransport for USBTransport {
+    fn read_message(&mut self) -> Result<ADBTransportMessage> {
+        self.read_message_with_timeout(
+            self.timeouts
+                .read
+                .unwrap_or(crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT),
+        )
+    }
+    fn write_message(&mut self, message: ADBTransportMessage) -> Result<()> {
+        self.write_message_with_timeout(
+            message,
+            self.timeouts
+                .write
+                .unwrap_or(crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT),
+        )
+    }
+
     fn write_message_with_timeout(
         &mut self,
         message: ADBTransportMessage,
         timeout: Duration,
     ) -> Result<()> {
+        let timeout =
+            if timeout == crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT {
+                Duration::ZERO
+            } else {
+                timeout
+            };
+        let _send = self
+            .send
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected))?
+            .lock()?;
         let message_bytes = message.header().as_bytes();
-        self.write_bulk_data(&message_bytes, timeout)?;
+        self.write_bulk_data(&message_bytes, bulk_timeout(timeout))?;
 
         log::trace!("successfully write header: {} bytes", message_bytes.len());
 
         let payload = message.into_payload();
         if !payload.is_empty() {
-            self.write_bulk_data(&payload, timeout)?;
+            self.write_bulk_data(&payload, bulk_timeout(timeout))?;
             log::trace!("successfully write payload: {} bytes", payload.len());
         }
 
@@ -242,41 +294,69 @@ impl ADBMessageTransport for USBTransport {
     }
 
     fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
+        self.read_packet(timeout, None)
+    }
+
+    fn read_message_with_deadline(&mut self, deadline: Instant) -> Result<ADBTransportMessage> {
+        self.read_packet(Duration::ZERO, Some(deadline))
+    }
+}
+
+impl USBTransport {
+    fn read_packet(
+        &mut self,
+        timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<ADBTransportMessage> {
         let endpoint = self.get_read_endpoint()?;
         let handle = self.get_raw_connection()?;
-        let max_packet_size = endpoint.max_packet_size;
+        self.receive
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected))?
+            .lock()?
+            .read(|bytes| {
+                loop {
+                    let remaining = match deadline {
+                        Some(deadline) => crate::message_devices::adb_message_transport::remaining_handshake_timeout(deadline)?,
+                        None if timeout == crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT => Duration::ZERO,
+                        None => timeout,
+                    };
+                    let size = handle.read_bulk(endpoint.address, bytes, bulk_timeout(remaining))?;
+                    if size != 0 {
+                        return Ok(size);
+                    }
+                }
+            })
+    }
+}
 
-        let mut data = [0u8; 24];
-        let mut offset = 0;
-        while offset < data.len() {
-            let end = (offset + max_packet_size).min(data.len());
-            let chunk = &mut data[offset..end];
-            offset += handle.read_bulk(endpoint.address, chunk, timeout)?;
-        }
+// rusb converts to u32 milliseconds: a sub-millisecond finite budget would
+// otherwise become libusb's zero (infinite), and oversized values would wrap.
+fn bulk_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::ZERO
+    } else {
+        timeout.clamp(
+            Duration::from_millis(1),
+            Duration::from_millis(u64::from(u32::MAX)),
+        )
+    }
+}
 
-        let header = ADBTransportMessageHeader::try_from(data)?;
-        log::trace!("received header {header:?}");
-
-        if header.data_length() != 0 {
-            let mut msg_data = vec![0_u8; header.data_length() as usize];
-            let mut offset = 0;
-            while offset < msg_data.len() {
-                offset += handle.read_bulk(endpoint.address, &mut msg_data[offset..], timeout)?;
-            }
-
-            let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
-
-            // Check message integrity
-            if !message.check_message_integrity() {
-                return Err(RustADBError::InvalidIntegrity(
-                    ADBTransportMessageHeader::compute_crc32(message.payload()),
-                    message.header().data_crc32(),
-                ));
-            }
-
-            return Ok(message);
-        }
-
-        Ok(ADBTransportMessage::from_header_and_payload(header, vec![]))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn finite_usb_timeouts_never_become_infinite_or_wrap() {
+        assert_eq!(bulk_timeout(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            bulk_timeout(Duration::from_nanos(1)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(bulk_timeout(Duration::from_secs(2)), Duration::from_secs(2));
+        assert_eq!(
+            bulk_timeout(Duration::MAX),
+            Duration::from_millis(u64::from(u32::MAX))
+        );
     }
 }

@@ -30,27 +30,63 @@ use utils::setup_logger;
 
 use crate::models::{ADBCliError, ADBCliResult};
 
+#[cfg(test)]
+mod issue_command_tests;
+
+fn command_output(path: Option<std::path::PathBuf>) -> ADBCliResult<Box<dyn Write>> {
+    Ok(match path {
+        Some(path) => Box::new(File::create(path)?),
+        None => Box::new(std::io::stdout()),
+    })
+}
+
+fn run_shell(device: &mut dyn ADBDeviceExt, commands: &[String]) -> ADBCliResult<()> {
+    if !commands.is_empty() {
+        device.shell_command(&commands.join(" "), Some(&mut std::io::stdout()), None)?;
+        return Ok(());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _terminal = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let terminal = ADBTermios::new(&std::io::stdin())?;
+        terminal.set_adb_termios()?;
+        Some(terminal)
+    } else {
+        None
+    };
+    device.shell(Box::new(std::io::stdin()), Box::new(std::io::stdout()))?;
+    Ok(())
+}
+
 fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) -> ADBCliResult<()> {
     match command {
-        DeviceCommands::Shell { commands } => {
-            if commands.is_empty() {
-                // Need to duplicate some code here as ADBTermios [Drop] implementation resets terminal state.
-                // Using a scope here would call drop() too early..
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                {
-                    let adb_termios = ADBTermios::new(&std::io::stdin())?;
-                    adb_termios.set_adb_termios()?;
-                    device.shell(Box::new(std::io::stdin()), Box::new(std::io::stdout()))?;
-                }
-
-                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                {
-                    device.shell(Box::new(std::io::stdin()), Box::new(std::io::stdout()))?;
-                }
+        DeviceCommands::ExecOut { output, command } => {
+            let mut output = command_output(output)?;
+            device.exec_out(&command.join(" "), &mut output)?;
+            output.flush()?;
+        }
+        DeviceCommands::Screenshot { path } => {
+            let mut output = command_output(path)?;
+            device.screenshot_png(&mut output)?;
+            output.flush()?;
+        }
+        DeviceCommands::Tap { x, y } => device.tap(x, y)?,
+        DeviceCommands::Packages {
+            system,
+            third_party,
+            user,
+        } => {
+            let filter = if system {
+                adb_client::PackageFilter::System
+            } else if third_party {
+                adb_client::PackageFilter::ThirdParty
             } else {
-                device.shell_command(&commands.join(" "), Some(&mut std::io::stdout()), None)?;
+                adb_client::PackageFilter::All
+            };
+            for package in device.list_packages(filter, user)? {
+                println!("{package}");
             }
         }
+        DeviceCommands::Shell { commands } => run_shell(&mut *device, &commands)?,
         DeviceCommands::Pull {
             source,
             destination,

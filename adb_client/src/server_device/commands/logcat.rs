@@ -1,55 +1,32 @@
+use crate::{Result, server_device::ADBServerDevice};
 use std::io::{self, Write};
-
-use crate::{ADBDeviceExt, Result, server_device::ADBServerDevice};
-
-struct LogFilter<W: Write> {
-    writer: W,
-    buffer: Vec<u8>,
-}
-
-impl<W: Write> LogFilter<W> {
-    pub const fn new(writer: W) -> Self {
-        Self {
-            writer,
-            buffer: Vec::new(),
-        }
-    }
-}
-
-impl<W: Write> Write for LogFilter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Add newly received bytes to the internal buffer
-        self.buffer.extend_from_slice(buf);
-
-        let mut processed = 0;
-        while let Some(pos) = self.buffer[processed..].iter().position(|&b| b == b'\n') {
-            // Found a newline, need to process it
-            let end = processed + pos + 1; // +1 to include the '\n'
-            let line = &self.buffer[processed..end];
-
-            self.writer.write_all(line)?;
-
-            processed = end;
-        }
-
-        // Keep only remaining bytes after the last complete line
-        if processed > 0 {
-            self.buffer.copy_within(processed.., 0);
-            self.buffer.truncate(self.buffer.len() - processed);
-        }
-
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
+use std::net::TcpStream;
 
 impl ADBServerDevice {
-    /// Get logs from device
-    pub fn get_logs<W: Write>(&mut self, output: W) -> Result<()> {
-        let _status = self.shell_command(&"exec logcat", Some(&mut LogFilter::new(output)), None);
+    /// Open a device service and transfer ownership of its socket to the caller.
+    ///
+    /// The returned stream remains usable after this device is dropped or used
+    /// for another command. Dropping the stream cancels the service.
+    pub fn open_service(&mut self, service: &str) -> Result<TcpStream> {
+        if service.len() > 0xffff || service.contains('\0') {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid ADB service name").into(),
+            );
+        }
+        self.set_serial_transport()?;
+        self.transport.send_service_request(service)?;
+        self.transport.take_connection()
+    }
+
+    /// Stream logcat output as a reader. Use `BufRead` for lines, or drop to cancel.
+    pub fn log_reader(&mut self) -> Result<TcpStream> {
+        self.open_service("exec:logcat")
+    }
+
+    /// Copy logcat bytes to a writer, preserving partial lines and I/O errors.
+    pub fn get_logs<W: Write>(&mut self, mut output: W) -> Result<()> {
+        io::copy(&mut self.log_reader()?, &mut output)?;
+        output.flush()?;
         Ok(())
     }
 }

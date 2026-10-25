@@ -13,11 +13,10 @@ use crate::{
     },
 };
 use std::{
-    fs::read_to_string,
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod connection;
@@ -29,6 +28,7 @@ use connection::Connection;
 #[derive(Clone, Debug)]
 pub struct TcpTransport {
     address: SocketAddr,
+    timeouts: crate::ADBTimeouts,
     current_connection: Option<Arc<Connection>>,
     private_key_path: PathBuf,
 }
@@ -44,9 +44,19 @@ impl TcpTransport {
     pub fn new<A: Into<SocketAddr>, P: AsRef<Path>>(address: A, private_key_path: P) -> Self {
         Self {
             address: address.into(),
+            timeouts: crate::ADBTimeouts::default(),
             current_connection: None,
             private_key_path: private_key_path.as_ref().to_path_buf(),
         }
+    }
+
+    pub(crate) fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        self.timeouts = timeouts.validate()?;
+        Ok(())
+    }
+
+    pub(crate) const fn timeouts(&self) -> crate::ADBTimeouts {
+        self.timeouts
     }
 
     fn get_current_connection(&self) -> Result<Arc<Connection>> {
@@ -62,8 +72,10 @@ impl TcpTransport {
 
 impl ADBTransport for TcpTransport {
     fn connect(&mut self) -> Result<()> {
-        self.current_connection =
-            Some(Arc::new(Connection::new(TcpStream::connect(self.address)?)));
+        self.current_connection = Some(Arc::new(Connection::new(match self.timeouts.handshake {
+            Some(timeout) => TcpStream::connect_timeout(&self.address, timeout)?,
+            None => TcpStream::connect(self.address)?,
+        })));
         Ok(())
     }
 
@@ -76,8 +88,31 @@ impl ADBTransport for TcpTransport {
 }
 
 impl ADBMessageTransport for TcpTransport {
+    fn read_message(&mut self) -> Result<ADBTransportMessage> {
+        self.read_message_with_timeout(
+            self.timeouts
+                .read
+                .unwrap_or(crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT),
+        )
+    }
+    fn write_message(&mut self, message: ADBTransportMessage) -> Result<()> {
+        self.write_message_with_timeout(
+            message,
+            self.timeouts
+                .write
+                .unwrap_or(crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT),
+        )
+    }
+
     fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
-        self.get_current_connection()?.read_message(timeout)
+        self.get_current_connection()?.read_message(timeout, None)
+    }
+
+    fn read_message_with_deadline(&mut self, deadline: Instant) -> Result<ADBTransportMessage> {
+        self.get_current_connection()?.read_message(
+            crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT,
+            Some(deadline),
+        )
     }
 
     fn write_message_with_timeout(
@@ -90,6 +125,14 @@ impl ADBMessageTransport for TcpTransport {
     }
 
     fn upgrade_connection(&mut self) -> Result<()> {
+        self.upgrade_connection_with_deadline(
+            self.timeouts
+                .handshake
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+        )
+    }
+
+    fn upgrade_connection_with_deadline(&mut self, deadline: Option<Instant>) -> Result<()> {
         let Some(connection) = self.current_connection.clone() else {
             return Err(RustADBError::UpgradeError(
                 "cannot upgrade a non-existing connection".into(),
@@ -100,17 +143,24 @@ impl ADBMessageTransport for TcpTransport {
                 "cannot upgrade a TLS connection".into(),
             ));
         }
-        let pk_content = read_to_string(&self.private_key_path)?;
+        let key = crate::message_devices::models::read_adb_private_key(&self.private_key_path)?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "ADB TLS needs a persisted private key",
+                )
+            })?;
+        let pk_content = key.to_pkcs8_pem()?;
         let key_pair = KeyPair::from_pkcs8_pem_and_sign_algo(&pk_content, &PKCS_RSA_SHA256)?;
         let certificate = certificate_from_pk(&key_pair)?;
-        let private_key = PrivatePkcs8KeyDer::from_pem_file(&self.private_key_path)?;
+        let private_key = PrivatePkcs8KeyDer::from_pem_slice(pk_content.as_bytes())?;
         let mut config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
             .with_client_auth_cert(certificate, private_key.into())?;
         config.key_log = Arc::new(KeyLogFile::new());
         let client = ClientConnection::new(Arc::new(config), self.address.ip().into())?;
-        connection.upgrade(client)
+        connection.upgrade(client, deadline)
     }
 }
 

@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     Result, adb_transport::ADBTransport,
     message_devices::adb_transport_message::ADBTransportMessage,
 };
 
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
+pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Trait representing a transport able to read and write messages.
@@ -17,8 +17,19 @@ pub trait ADBMessageTransport: ADBTransport + Clone + Send + 'static {
         Ok(())
     }
 
+    /// Upgrade within the remaining connection-handshake deadline.
+    /// Custom transports retain their existing upgrade implementation by default.
+    fn upgrade_connection_with_deadline(&mut self, _deadline: Option<Instant>) -> Result<()> {
+        self.upgrade_connection()
+    }
+
     /// Read a message using given timeout on the underlying transport
     fn read_message_with_timeout(&mut self, read_timeout: Duration) -> Result<ADBTransportMessage>;
+
+    /// Read a handshake packet within an absolute deadline, including fragments.
+    fn read_message_with_deadline(&mut self, deadline: Instant) -> Result<ADBTransportMessage> {
+        self.read_message_with_timeout(remaining_handshake_timeout(deadline)?)
+    }
 
     /// Read data to underlying connection, using default timeout
     fn read_message(&mut self) -> Result<ADBTransportMessage> {
@@ -36,4 +47,11 @@ pub trait ADBMessageTransport: ADBTransport + Clone + Send + 'static {
     fn write_message(&mut self, message: ADBTransportMessage) -> Result<()> {
         self.write_message_with_timeout(message, DEFAULT_WRITE_TIMEOUT)
     }
+}
+
+pub(crate) fn remaining_handshake_timeout(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
 }

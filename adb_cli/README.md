@@ -66,3 +66,17 @@ Options:
   -k, --private-key <PATH_TO_PRIVATE_KEY>  Path to a custom private key to use for authentication
   -h, --help                               Print help
 ```
+
+## Binary output and package helpers
+
+```sh
+adb_cli local exec-out screencap -p > screen.png
+adb_cli local exec-out --output screen.png screencap -p
+adb_cli local screenshot screen.png
+adb_cli local tap 100 200
+adb_cli local packages --third-party
+adb_cli local packages --system --user 0
+```
+
+These device commands also work with the USB and TCP backends. `exec-out` and
+`screenshot` write raw bytes; the default package user is the current Android user.

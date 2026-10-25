@@ -2,14 +2,17 @@ use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustls::ClientConnection;
 
 use crate::{
     Result, RustADBError,
-    message_devices::adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
+    message_devices::{
+        adb_message_transport::DEFAULT_READ_TIMEOUT, adb_transport_message::ADBTransportMessage,
+        packet_reader::PacketReader,
+    },
 };
 
 #[derive(Debug, Default)]
@@ -18,13 +21,19 @@ struct ReceiveBuffer {
     consumed: usize,
 }
 
+#[derive(Debug, Default)]
+struct ReceiveState {
+    tls_input: ReceiveBuffer,
+    packet: PacketReader,
+}
+
 /// Message readers and writers serialize independently. TLS state is locked only
 /// while processing memory buffers, never during blocking socket I/O after upgrade.
 #[derive(Debug)]
 pub(super) struct Connection {
     socket: TcpStream,
     tls: Mutex<Option<Box<ClientConnection>>>,
-    receive: Mutex<ReceiveBuffer>,
+    receive: Mutex<ReceiveState>,
     send: Mutex<Vec<u8>>,
 }
 
@@ -42,7 +51,11 @@ impl Connection {
         Ok(self.tls.lock()?.is_some())
     }
 
-    pub(super) fn upgrade(&self, mut client: ClientConnection) -> Result<()> {
+    pub(super) fn upgrade(
+        &self,
+        mut client: ClientConnection,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         // An upgrade owns both directions until the handshake is complete.
         let _receive = self.receive.lock()?;
         let _send = self.send.lock()?;
@@ -52,7 +65,10 @@ impl Connection {
                 "cannot upgrade a TLS connection".into(),
             ));
         }
-        client.complete_io(&mut &self.socket)?;
+        client.complete_io(&mut HandshakeIo {
+            socket: &self.socket,
+            deadline,
+        })?;
         *tls = Some(Box::new(client));
         Ok(())
     }
@@ -65,26 +81,20 @@ impl Connection {
         Ok(())
     }
 
-    pub(super) fn read_message(&self, timeout: Duration) -> Result<ADBTransportMessage> {
-        let mut pending = self.receive.lock()?;
-        self.socket.set_read_timeout(Some(timeout))?;
+    pub(super) fn read_message(
+        &self,
+        timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<ADBTransportMessage> {
+        let mut state = self.receive.lock()?;
+        let ReceiveState { tls_input, packet } = &mut *state;
         let mut reader = ConnectionReader {
             connection: self,
-            pending: &mut pending,
+            pending: tls_input,
+            timeout: (timeout != DEFAULT_READ_TIMEOUT).then_some(timeout),
+            deadline,
         };
-        let mut bytes = [0; 24];
-        reader.read_exact(&mut bytes)?;
-        let header = ADBTransportMessageHeader::try_from(bytes)?;
-        let mut payload = vec![0; header.data_length() as usize];
-        reader.read_exact(&mut payload)?;
-        let message = ADBTransportMessage::from_header_and_payload(header, payload);
-        if !message.payload().is_empty() && !message.check_message_integrity() {
-            return Err(RustADBError::InvalidIntegrity(
-                ADBTransportMessageHeader::compute_crc32(message.payload()),
-                message.header().data_crc32(),
-            ));
-        }
-        Ok(message)
+        packet.read(|bytes| reader.read(bytes).map_err(Into::into))
     }
 
     pub(super) fn write_message(
@@ -94,7 +104,8 @@ impl Connection {
     ) -> Result<()> {
         // Keep an entire ADB header/payload together across concurrent writers.
         let mut encrypted = self.send.lock()?;
-        self.socket.set_write_timeout(Some(timeout))?;
+        self.socket
+            .set_write_timeout((timeout != DEFAULT_READ_TIMEOUT).then_some(timeout))?;
         let mut writer = ConnectionWriter {
             connection: self,
             encrypted: &mut encrypted,
@@ -109,6 +120,22 @@ impl Connection {
 struct ConnectionReader<'a> {
     connection: &'a Connection,
     pending: &'a mut ReceiveBuffer,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+}
+impl ConnectionReader<'_> {
+    fn read_socket(&self, output: &mut [u8]) -> io::Result<usize> {
+        let timeout = match self.deadline {
+            Some(deadline) => Some(
+                crate::message_devices::adb_message_transport::remaining_handshake_timeout(
+                    deadline,
+                )?,
+            ),
+            None => self.timeout,
+        };
+        self.connection.socket.set_read_timeout(timeout)?;
+        (&self.connection.socket).read(output)
+    }
 }
 
 impl Read for ConnectionReader<'_> {
@@ -124,7 +151,7 @@ impl Read for ConnectionReader<'_> {
                 .map_err(|_| io::Error::other("TLS state mutex was poisoned"))?;
             let Some(tls) = state.as_mut() else {
                 drop(state);
-                return (&self.connection.socket).read(output);
+                return self.read_socket(output);
             };
             match tls.reader().read(output) {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
@@ -146,8 +173,25 @@ impl Read for ConnectionReader<'_> {
             // TLS is already handshaken. Any post-handshake response is queued
             // for the next writer; receiving never waits for the send lock.
             drop(state);
+            let timeout = match self.deadline {
+                Some(deadline) => Some(
+                    crate::message_devices::adb_message_transport::remaining_handshake_timeout(
+                        deadline,
+                    )?,
+                ),
+                None => self.timeout,
+            };
+            self.connection.socket.set_read_timeout(timeout)?;
             self.pending.encrypted.resize(16 * 1024, 0);
-            let size = (&self.connection.socket).read(&mut self.pending.encrypted)?;
+            let size = match (&self.connection.socket).read(&mut self.pending.encrypted) {
+                Ok(size) => size,
+                Err(error) => {
+                    // The resized region is scratch space, never TLS input.
+                    self.pending.encrypted.clear();
+                    self.pending.consumed = 0;
+                    return Err(error);
+                }
+            };
             if size == 0 {
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
@@ -202,5 +246,40 @@ impl Write for ConnectionWriter<'_> {
             drop(state);
         }
         (&self.connection.socket).flush()
+    }
+}
+
+// rustls can perform many reads/writes inside complete_io. Recompute the
+// remaining budget at every syscall so partial TLS records cannot extend it.
+struct HandshakeIo<'a> {
+    socket: &'a TcpStream,
+    deadline: Option<Instant>,
+}
+impl HandshakeIo<'_> {
+    fn remaining(&self) -> io::Result<Option<Duration>> {
+        self.deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+            })
+            .transpose()
+    }
+}
+impl Read for HandshakeIo<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.socket.set_read_timeout(self.remaining()?)?;
+        self.socket.read(bytes)
+    }
+}
+impl Write for HandshakeIo<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.socket.set_write_timeout(self.remaining()?)?;
+        self.socket.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.remaining()?;
+        self.socket.flush()
     }
 }
