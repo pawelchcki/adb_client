@@ -38,5 +38,9 @@ it reports admission_disabled or operator_only, an authorized Runnerless operato
 must connect the repository; do not edit its database, impersonate the operator,
 forge checks or relax protection. Until the App emits the required current-head
 checks, GitHub deliberately blocks merging. Verify actual check delivery and a
-completed Codex verdict on an open PR after enrollment. Existing upstream Actions
-workflows remain intact and continue to supply their independent validation.
+completed Codex verdict on an open PR after enrollment. Existing build, Python-package and release workflows are preserved. The quality
+workflow retains Clippy, formatting, MSRV, docs, tests, dependency reporting and
+unused-dependency checks. Dependency reporting reads each crate's latest stable
+release independently, so incompatible newest PyO3/numpy/stub-generator versions
+do not turn an informational report into a dependency-resolution failure. Registry
+or metadata errors still fail that job.

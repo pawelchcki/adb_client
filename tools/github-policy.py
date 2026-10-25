@@ -10,13 +10,16 @@ from pathlib import Path
 import subprocess
 
 
-def api(path, method='GET', data=None):
+def api(path, method='GET', data=None, paginate=False):
     command = ['gh', 'api', '--method', method, path]
     if data is not None:
         command += ['--input', '-']
+    if paginate:
+        command += ['--paginate', '--slurp']
     reply = subprocess.run(command, input=None if data is None else json.dumps(data),
                            text=True, capture_output=True, check=True)
-    return json.loads(reply.stdout)
+    value = json.loads(reply.stdout)
+    return [item for page in value for item in page] if paginate else value
 
 
 def contains(actual, expected):
@@ -38,7 +41,7 @@ def main():
     if repository['id'] != config['repository_id']:
         raise SystemExit('Repository identity mismatch; refusing to change a reused name')
     ruleset = config['ruleset']
-    summaries = [r for r in api(path + '/rulesets') if r['name'] == ruleset['name']]
+    summaries = [r for r in api(path + '/rulesets', paginate=True) if r['name'] == ruleset['name']]
     if len(summaries) > 1:
         raise SystemExit('Ambiguous ruleset name; resolve duplicate policies first')
     if args.apply:
@@ -62,7 +65,7 @@ def main():
         raise SystemExit('Repository merge settings do not match policy')
     print('Verified: PR-only default branch, no bypass/force-push/deletion, squash merges,')
     print('and App-pinned Codex review + PR-title checks (integration 4602759).')
-    print('Runnerless enrollment and automatic review delivery require separate live verification.')
+    print('Runnerless enrollment and current-head review check delivery require separate live verification.')
 
 
 if __name__ == '__main__':
