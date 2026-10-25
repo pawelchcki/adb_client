@@ -22,6 +22,8 @@ mod message_commands;
 mod models;
 mod utils;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use adb_message_device::AuthPolicy;
 pub use utils::BinaryDecodable;
 
 /// Asynchronous browser USB connections and in-memory host keys.

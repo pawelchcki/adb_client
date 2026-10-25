@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::ADBDeviceExt;
 use crate::ADBListItemType;
+use crate::AuthPolicy;
 use crate::Result;
 use crate::RustADBError;
 use crate::message_devices::adb_message_device::ADBMessageDevice;
@@ -49,15 +50,39 @@ impl ADBUSBDevice {
         Self::new_from_transport_inner(transport, &private_key_path)
     }
 
+    /// Instantiate a new [`ADBUSBDevice`] from a [`USBTransport`], authenticating as `policy` allows.
+    ///
+    /// With [`AuthPolicy::ExistingKeyOnly`] the device never shows an authorization dialog;
+    /// a key it does not already trust fails the connection.
+    pub fn new_from_transport_with_auth_policy(
+        transport: USBTransport,
+        private_key_path: PathBuf,
+        policy: AuthPolicy,
+    ) -> Result<Self> {
+        Self::new_from_transport_with_policy(transport, private_key_path, policy)
+    }
+
     fn new_from_transport_inner<P: AsRef<Path>>(
         transport: USBTransport,
         private_key_path: P,
+    ) -> Result<Self> {
+        Self::new_from_transport_with_policy(
+            transport,
+            private_key_path,
+            AuthPolicy::OfferPublicKey,
+        )
+    }
+
+    fn new_from_transport_with_policy<P: AsRef<Path>>(
+        transport: USBTransport,
+        private_key_path: P,
+        policy: AuthPolicy,
     ) -> Result<Self> {
         let vendor_id = transport.vendor_id()?;
         let product_id = transport.product_id()?;
 
         Ok(Self {
-            inner: ADBMessageDevice::new(transport, private_key_path)?,
+            inner: ADBMessageDevice::new_with_auth_policy(transport, private_key_path, policy)?,
             vendor_id,
             product_id,
         })

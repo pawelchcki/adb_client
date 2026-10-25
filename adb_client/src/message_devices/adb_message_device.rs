@@ -20,6 +20,19 @@ use crate::{
     models::ADBLocalCommand,
 };
 
+/// How the host proves its identity when the device asks for authentication.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthPolicy {
+    /// Sign the device's token, then offer the public key so the user can
+    /// approve this host on the device. A missing key is replaced by a random one.
+    #[default]
+    OfferPublicKey,
+    /// Only sign the device's token with the existing key. Never offer the
+    /// public key, so the device shows no authorization dialog; a missing or
+    /// untrusted key fails the connection instead.
+    ExistingKeyOnly,
+}
+
 /// Generic structure representing an ADB device reachable over an [`ADBMessageTransport`].
 /// Structure is totally agnostic over which transport is truly used.
 #[derive(Debug)]
@@ -31,9 +44,23 @@ pub struct ADBMessageDevice<T: ADBMessageTransport> {
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// Instantiate a new [`ADBMessageDevice`]
-    pub fn new<P: AsRef<Path>>(mut transport: T, adb_private_key_path: P) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(transport: T, adb_private_key_path: P) -> Result<Self> {
+        Self::new_with_auth_policy(transport, adb_private_key_path, AuthPolicy::OfferPublicKey)
+    }
+
+    /// Instantiate a new [`ADBMessageDevice`] authenticating as `policy` allows.
+    pub fn new_with_auth_policy<P: AsRef<Path>>(
+        mut transport: T,
+        adb_private_key_path: P,
+        policy: AuthPolicy,
+    ) -> Result<Self> {
         let private_key = if let Some(private_key) = read_adb_private_key(&adb_private_key_path)? {
             private_key
+        } else if policy == AuthPolicy::ExistingKeyOnly {
+            return Err(RustADBError::ADBRequestFailed(format!(
+                "No private key found at path {}",
+                adb_private_key_path.as_ref().display()
+            )));
         } else {
             log::warn!(
                 "No private key found at path {}. Generating a new random.",
@@ -42,7 +69,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             ADBRsaKey::new_random()?
         };
 
-        let max_payload_size = match Self::connect(&mut transport, &private_key) {
+        let max_payload_size = match Self::connect(&mut transport, &private_key, policy) {
             Ok(max_payload_size) => max_payload_size,
             Err(e) => {
                 // Best effort here
@@ -62,7 +89,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     }
 
     /// Send initial connect, and return the negotiated maximum payload size
-    fn connect(transport: &mut T, private_key: &ADBRsaKey) -> Result<usize> {
+    fn connect(transport: &mut T, private_key: &ADBRsaKey, policy: AuthPolicy) -> Result<usize> {
         transport.connect()?;
 
         let message = ADBTransportMessage::try_new(
@@ -97,7 +124,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             }
             MessageCommand::Auth => {
                 log::debug!("Authentication required");
-                Self::auth_handshake(transport, message, private_key)
+                Self::auth_handshake(transport, message, private_key, policy)
             }
             _ => Err(crate::RustADBError::WrongResponseReceived(
                 message.header().command().to_string(),
@@ -137,6 +164,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         transport: &mut T,
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
+        policy: AuthPolicy,
     ) -> Result<usize> {
         // At this point, we should have received an AUTH message with arg0 == 1
         let auth_message = match message.header().arg0() {
@@ -159,6 +187,13 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         if received_response.header().command() == MessageCommand::Cnxn {
             log::info!("Authentication OK");
             return Self::handle_connection(&received_response);
+        }
+
+        if policy == AuthPolicy::ExistingKeyOnly {
+            return Err(RustADBError::ADBRequestFailed(
+                "The device did not accept the existing key; authorization was not requested"
+                    .into(),
+            ));
         }
 
         let mut pubkey = private_key.android_pubkey_encode()?.into_bytes();
