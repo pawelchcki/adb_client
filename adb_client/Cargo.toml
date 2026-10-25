@@ -19,6 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["framebuffer"]
+async = ["dep:tokio"]
 mdns = ["dep:mdns-sd"]
 usb = ["dep:rusb"]
 webusb = ["dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
@@ -42,6 +43,7 @@ thiserror = { version = "2.0.21" }
 
 # Native-only TLS, discovery and USB backends.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.53", optional = true, features = ["net", "io-util", "rt", "time"] }
 rcgen = { version = "0.14.10", default-features = false, features = [
     "ring",
     "pem",

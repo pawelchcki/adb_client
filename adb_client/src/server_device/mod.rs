@@ -3,6 +3,8 @@
 mod adb_server_device;
 mod adb_server_device_commands;
 mod commands;
+#[cfg(test)]
+mod tests;
 
 pub use adb_server_device::ADBServerDevice;
 pub use commands::ADBSyncSession;

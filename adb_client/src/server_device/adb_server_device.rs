@@ -34,6 +34,17 @@ pub struct CachedFeatures {
 }
 
 impl ADBServerDevice {
+    /// Configure connection and command I/O timeouts on this server device.
+    pub fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        self.transport.set_timeouts(timeouts)
+    }
+
+    /// Configure timeouts while building a server device.
+    pub fn with_timeouts(mut self, timeouts: crate::ADBTimeouts) -> Result<Self> {
+        self.set_timeouts(timeouts)?;
+        Ok(self)
+    }
+
     /// Instantiates a new [`ADBServerDevice`], knowing its ADB identifier (as returned by `adb devices` command).
     #[must_use]
     pub fn new(identifier: String, server_addr: Option<SocketAddrV4>) -> Self {

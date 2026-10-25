@@ -63,11 +63,9 @@ impl Display for ADBLocalCommand {
                     write!(f, "shell,{args_s},raw:{command}")
                 }
             }
-            // `pty` allocates a terminal on device: required for an interactive session
-            Self::Shell => match std::env::var("TERM") {
-                Ok(term) => write!(f, "shell,TERM={term},pty:"),
-                Err(_) => write!(f, "shell,pty:"),
-            },
+            // Legacy interactive shells already allocate a PTY. Shell-v2 options
+            // must not be sent without negotiating and decoding shell-v2 framing.
+            Self::Shell => write!(f, "shell:"),
             Self::Exec(command) => write!(f, "exec:{command}"),
             Self::Reboot(reboot_type) => {
                 write!(f, "reboot:{reboot_type}")

@@ -278,6 +278,61 @@ fn fragmented_list_ignores_stale_initial_and_continuation_packets() {
 }
 
 #[test]
+fn raw_exec_and_screenshot_preserve_binary_output_without_early_close() {
+    let bytes = b"\x89PNG\r\n\x1a\n\0\xff\r\n";
+    for screenshot in [false, true] {
+        let mut device = device(Some(bytes));
+        let mut output = Vec::new();
+        if screenshot {
+            device.screenshot_png(&mut output).unwrap();
+        } else {
+            device.exec_out("cat /data/binary", &mut output).unwrap();
+        }
+        assert_eq!(output, bytes);
+        let sent = device.transport.sent.lock().unwrap();
+        assert!(sent[0].payload().starts_with(b"exec:"));
+        assert!(
+            !sent
+                .iter()
+                .any(|message| message.header().command() == MessageCommand::Clse)
+        );
+    }
+}
+
+#[test]
+fn package_lists_select_users_and_reject_android_errors() {
+    for (filter, flag) in [
+        (crate::PackageFilter::All, ""),
+        (crate::PackageFilter::System, " -s"),
+        (crate::PackageFilter::ThirdParty, " -3"),
+    ] {
+        for user in [None, Some(10)] {
+            let mut device = device(Some(
+                b"package:org.example.one\npackage:com.example.two\r\n",
+            ));
+            assert_eq!(
+                device.list_packages(filter, user).unwrap(),
+                ["org.example.one", "com.example.two"]
+            );
+            let sent = device.transport.sent.lock().unwrap();
+            let user = user.map_or_else(|| "current".into(), |id| id.to_string());
+            assert_eq!(
+                sent[0].payload(),
+                format!("shell:pm list packages{flag} --user {user}\0").as_bytes()
+            );
+        }
+    }
+    let mut device = device(Some(
+        b"Exception occurred while executing 'list': SecurityException\n",
+    ));
+    assert!(
+        device
+            .list_packages(crate::PackageFilter::All, None)
+            .is_err()
+    );
+}
+
+#[test]
 fn handshake_rejects_payload_limits_that_cannot_hold_sync_data() {
     for limit in 0..=8 {
         let cnxn = packet(MessageCommand::Cnxn, 0x0100_0000, limit, b"device::\0");

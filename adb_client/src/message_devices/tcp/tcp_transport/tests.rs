@@ -183,3 +183,36 @@ fn plaintext_reader_does_not_block_writers_or_interleave_packets() {
 fn tls_reader_does_not_block_writers_or_interleave_packets() {
     exercise_duplex(true);
 }
+
+#[test]
+fn native_handshake_timeout_does_not_wait_for_the_default_read_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, wait) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut stream).header().command(),
+            MessageCommand::Cnxn
+        );
+        let _ = wait.recv_timeout(Duration::from_secs(3));
+    });
+    let key = key_file();
+    let error = crate::tcp::ADBTcpDevice::new_with_custom_private_key_and_timeouts(
+        address,
+        &key.0,
+        crate::ADBTimeouts {
+            handshake: Some(Duration::from_millis(50)),
+            ..crate::ADBTimeouts::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, RustADBError::IOError(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+    );
+    release.send(()).unwrap();
+    peer.join().unwrap();
+}

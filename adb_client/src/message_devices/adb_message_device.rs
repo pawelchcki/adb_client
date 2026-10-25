@@ -3,7 +3,10 @@ use rand::RngExt;
 #[cfg(test)]
 mod tests;
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use crate::{
     Result, RustADBError,
@@ -30,8 +33,11 @@ pub struct ADBMessageDevice<T: ADBMessageTransport> {
 }
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
-    /// Instantiate a new [`ADBMessageDevice`]
-    pub fn new<P: AsRef<Path>>(mut transport: T, adb_private_key_path: P) -> Result<Self> {
+    pub(crate) fn new_with_handshake_timeout<P: AsRef<Path>>(
+        mut transport: T,
+        adb_private_key_path: P,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
         let private_key = if let Some(private_key) = read_adb_private_key(&adb_private_key_path)? {
             private_key
         } else {
@@ -42,7 +48,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             ADBRsaKey::new_random()?
         };
 
-        let max_payload_size = match Self::connect(&mut transport, &private_key) {
+        let max_payload_size = match Self::connect(&mut transport, &private_key, timeout) {
             Ok(max_payload_size) => max_payload_size,
             Err(e) => {
                 // Best effort here
@@ -62,7 +68,21 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     }
 
     /// Send initial connect, and return the negotiated maximum payload size
-    fn connect(transport: &mut T, private_key: &ADBRsaKey) -> Result<usize> {
+    fn connect(
+        transport: &mut T,
+        private_key: &ADBRsaKey,
+        timeout: Option<Duration>,
+    ) -> Result<usize> {
+        let deadline = timeout
+            .map(|duration| {
+                Instant::now().checked_add(duration).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "handshake timeout is too large",
+                    )
+                })
+            })
+            .transpose()?;
         transport.connect()?;
 
         let message = ADBTransportMessage::try_new(
@@ -74,7 +94,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         transport.write_message(message)?;
 
-        let message = Self::read_handshake_message(transport, None)?;
+        let message = Self::read_handshake_message(transport, deadline)?;
 
         // Check if a client is requesting a secure connection and upgrade it if necessary
         match message.header().command() {
@@ -88,7 +108,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 transport.upgrade_connection()?;
                 log::debug!("Connection successfully upgraded from TCP to TLS");
 
-                let message = Self::read_handshake_message(transport, None)?;
+                let message = Self::read_handshake_message(transport, deadline)?;
                 Self::handle_connection(&message)
             }
             MessageCommand::Cnxn => {
@@ -97,7 +117,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             }
             MessageCommand::Auth => {
                 log::debug!("Authentication required");
-                Self::auth_handshake(transport, message, private_key)
+                Self::auth_handshake(transport, message, private_key, deadline)
             }
             _ => Err(crate::RustADBError::WrongResponseReceived(
                 message.header().command().to_string(),
@@ -112,13 +132,17 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// properly closed.
     fn read_handshake_message(
         transport: &mut T,
-        timeout: Option<Duration>,
+        deadline: Option<Instant>,
     ) -> Result<ADBTransportMessage> {
         loop {
-            let message = match timeout {
-                Some(timeout) => transport.read_message_with_timeout(timeout)?,
-                None => transport.read_message()?,
+            let timeout = match deadline {
+                Some(deadline) => deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?,
+                None => crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT,
             };
+            let message = transport.read_message_with_timeout(timeout)?;
 
             match message.header().command() {
                 MessageCommand::Okay | MessageCommand::Write | MessageCommand::Clse => {
@@ -137,6 +161,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         transport: &mut T,
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
+        deadline: Option<Instant>,
     ) -> Result<usize> {
         // At this point, we should have received an AUTH message with arg0 == 1
         let auth_message = match message.header().arg0() {
@@ -154,7 +179,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         transport.write_message(message)?;
 
-        let received_response = Self::read_handshake_message(transport, None)?;
+        let received_response = Self::read_handshake_message(transport, deadline)?;
 
         if received_response.header().command() == MessageCommand::Cnxn {
             log::info!("Authentication OK");
@@ -169,7 +194,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         transport.write_message(message)?;
 
-        let response = Self::read_handshake_message(transport, Some(Duration::from_secs(10)))?;
+        let response = Self::read_handshake_message(transport, deadline)?;
 
         log::info!("Authentication OK");
         Self::handle_connection(&response)

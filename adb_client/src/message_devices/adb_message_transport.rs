@@ -5,7 +5,7 @@ use crate::{
     message_devices::adb_transport_message::ADBTransportMessage,
 };
 
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
+pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Trait representing a transport able to read and write messages.

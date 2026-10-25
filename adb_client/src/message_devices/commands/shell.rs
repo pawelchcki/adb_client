@@ -18,6 +18,18 @@ use crate::{
 };
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+    pub(crate) fn exec_out(&mut self, command: &str, output: &mut dyn Write) -> Result<()> {
+        let mut session = self.open_session(&ADBLocalCommand::Exec(command.to_owned()))?;
+        loop {
+            let message = session.recv_and_reply_okay()?;
+            match message.header().command() {
+                MessageCommand::Write => output.write_all(message.payload())?,
+                MessageCommand::Clse => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+
     /// Runs 'command' in a shell on the device, and write its output and error streams into output.
     pub(crate) fn shell_command(
         &mut self,

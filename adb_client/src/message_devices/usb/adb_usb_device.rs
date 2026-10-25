@@ -56,11 +56,44 @@ impl ADBUSBDevice {
         let vendor_id = transport.vendor_id()?;
         let product_id = transport.product_id()?;
 
+        let handshake = transport.timeouts().handshake;
         Ok(Self {
-            inner: ADBMessageDevice::new(transport, private_key_path)?,
+            inner: ADBMessageDevice::new_with_handshake_timeout(
+                transport,
+                private_key_path,
+                handshake,
+            )?,
             vendor_id,
             product_id,
         })
+    }
+
+    /// Connect to a USB device with explicit handshake and command I/O timeouts.
+    pub fn new_with_timeouts(
+        vendor_id: u16,
+        product_id: u16,
+        timeouts: crate::ADBTimeouts,
+    ) -> Result<Self> {
+        let mut transport = USBTransport::new(vendor_id, product_id)?;
+        transport.set_timeouts(timeouts)?;
+        Self::new_from_transport(transport, None)
+    }
+
+    /// Connect using a custom key and explicit handshake and command I/O timeouts.
+    pub fn new_with_custom_private_key_and_timeouts<P: AsRef<Path>>(
+        vendor_id: u16,
+        product_id: u16,
+        private_key_path: P,
+        timeouts: crate::ADBTimeouts,
+    ) -> Result<Self> {
+        let mut transport = USBTransport::new(vendor_id, product_id)?;
+        transport.set_timeouts(timeouts)?;
+        Self::new_from_transport_inner(transport, private_key_path)
+    }
+
+    /// Change subsequent command I/O timeouts on this connection.
+    pub fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        self.inner.get_transport_mut().set_timeouts(timeouts)
     }
 
     /// Returns the vendor ID of the device
@@ -104,6 +137,10 @@ impl ADBUSBDevice {
 }
 
 impl ADBDeviceExt for ADBUSBDevice {
+    fn exec_out(&mut self, command: &str, output: &mut dyn Write) -> Result<()> {
+        self.inner.exec_out(command, output)
+    }
+
     #[inline]
     fn shell_command(
         &mut self,

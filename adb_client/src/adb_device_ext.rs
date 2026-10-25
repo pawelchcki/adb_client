@@ -12,6 +12,73 @@ use crate::{ADBStatExtendedResponse, RebootType, Result};
 
 /// Trait representing all features available on ADB devices.
 pub trait ADBDeviceExt {
+    /// Read raw command output without a PTY or a background stdin reader.
+    ///
+    /// Built-in native devices implement this directly. The default keeps
+    /// third-party implementations source-compatible and reports unsupported I/O.
+    fn exec_out(&mut self, _command: &str, _output: &mut dyn Write) -> Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exec_out is not implemented",
+        )
+        .into())
+    }
+
+    /// Capture a PNG screenshot using Android's `screencap`, without re-encoding.
+    fn screenshot_png(&mut self, output: &mut dyn Write) -> Result<()> {
+        self.exec_out("screencap -p", output)
+    }
+
+    /// Send a touchscreen tap at the given nonnegative device coordinates.
+    fn tap(&mut self, x: u32, y: u32) -> Result<()> {
+        let mut output = Vec::new();
+        let status = self.shell_command(&format!("input tap {x} {y}"), Some(&mut output), None)?;
+        if status.is_some_and(|status| status != 0) || !output.is_empty() {
+            return Err(crate::RustADBError::ADBRequestFailed(
+                String::from_utf8_lossy(&output).into_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// List package names for the current Android user, or an explicit user ID.
+    ///
+    /// `filter` selects all, system or third-party packages. An absent user means
+    /// `current`, avoiding inaccessible secondary profiles such as Secure Folder.
+    fn list_packages(
+        &mut self,
+        filter: crate::PackageFilter,
+        user: Option<u32>,
+    ) -> Result<Vec<String>> {
+        let flag = match filter {
+            crate::PackageFilter::All => "",
+            crate::PackageFilter::System => " -s",
+            crate::PackageFilter::ThirdParty => " -3",
+        };
+        let user = user.map_or_else(|| "current".to_owned(), |id| id.to_string());
+        let mut output = Vec::new();
+        let status = self.shell_command(
+            &format!("pm list packages{flag} --user {user}"),
+            Some(&mut output),
+            None,
+        )?;
+        let text = String::from_utf8(output)?;
+        if status.is_some_and(|status| status != 0) {
+            return Err(crate::RustADBError::ADBRequestFailed(text));
+        }
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let name = line
+                    .trim()
+                    .strip_prefix("package:")
+                    .filter(|name| !name.is_empty() && !name.chars().any(char::is_whitespace));
+                name.map(str::to_owned)
+                    .ok_or_else(|| crate::RustADBError::ADBRequestFailed(text.clone()))
+            })
+            .collect()
+    }
+
     /// Runs command in a shell on the device, and write its output and error streams into output.
     fn shell_command(
         &mut self,

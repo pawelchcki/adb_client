@@ -9,7 +9,10 @@ use rustls::ClientConnection;
 
 use crate::{
     Result, RustADBError,
-    message_devices::adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
+    message_devices::{
+        adb_message_transport::DEFAULT_READ_TIMEOUT, adb_transport_message::ADBTransportMessage,
+        packet_reader::PacketReader,
+    },
 };
 
 #[derive(Debug, Default)]
@@ -18,13 +21,19 @@ struct ReceiveBuffer {
     consumed: usize,
 }
 
+#[derive(Debug, Default)]
+struct ReceiveState {
+    tls_input: ReceiveBuffer,
+    packet: PacketReader,
+}
+
 /// Message readers and writers serialize independently. TLS state is locked only
 /// while processing memory buffers, never during blocking socket I/O after upgrade.
 #[derive(Debug)]
 pub(super) struct Connection {
     socket: TcpStream,
     tls: Mutex<Option<Box<ClientConnection>>>,
-    receive: Mutex<ReceiveBuffer>,
+    receive: Mutex<ReceiveState>,
     send: Mutex<Vec<u8>>,
 }
 
@@ -66,25 +75,15 @@ impl Connection {
     }
 
     pub(super) fn read_message(&self, timeout: Duration) -> Result<ADBTransportMessage> {
-        let mut pending = self.receive.lock()?;
-        self.socket.set_read_timeout(Some(timeout))?;
+        let mut state = self.receive.lock()?;
+        self.socket
+            .set_read_timeout((timeout != DEFAULT_READ_TIMEOUT).then_some(timeout))?;
+        let ReceiveState { tls_input, packet } = &mut *state;
         let mut reader = ConnectionReader {
             connection: self,
-            pending: &mut pending,
+            pending: tls_input,
         };
-        let mut bytes = [0; 24];
-        reader.read_exact(&mut bytes)?;
-        let header = ADBTransportMessageHeader::try_from(bytes)?;
-        let mut payload = vec![0; header.data_length() as usize];
-        reader.read_exact(&mut payload)?;
-        let message = ADBTransportMessage::from_header_and_payload(header, payload);
-        if !message.payload().is_empty() && !message.check_message_integrity() {
-            return Err(RustADBError::InvalidIntegrity(
-                ADBTransportMessageHeader::compute_crc32(message.payload()),
-                message.header().data_crc32(),
-            ));
-        }
-        Ok(message)
+        packet.read(|bytes| reader.read(bytes).map_err(Into::into))
     }
 
     pub(super) fn write_message(
@@ -94,7 +93,8 @@ impl Connection {
     ) -> Result<()> {
         // Keep an entire ADB header/payload together across concurrent writers.
         let mut encrypted = self.send.lock()?;
-        self.socket.set_write_timeout(Some(timeout))?;
+        self.socket
+            .set_write_timeout((timeout != DEFAULT_READ_TIMEOUT).then_some(timeout))?;
         let mut writer = ConnectionWriter {
             connection: self,
             encrypted: &mut encrypted,

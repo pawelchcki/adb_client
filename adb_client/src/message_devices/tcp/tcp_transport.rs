@@ -29,6 +29,7 @@ use connection::Connection;
 #[derive(Clone, Debug)]
 pub struct TcpTransport {
     address: SocketAddr,
+    timeouts: crate::ADBTimeouts,
     current_connection: Option<Arc<Connection>>,
     private_key_path: PathBuf,
 }
@@ -44,9 +45,15 @@ impl TcpTransport {
     pub fn new<A: Into<SocketAddr>, P: AsRef<Path>>(address: A, private_key_path: P) -> Self {
         Self {
             address: address.into(),
+            timeouts: crate::ADBTimeouts::default(),
             current_connection: None,
             private_key_path: private_key_path.as_ref().to_path_buf(),
         }
+    }
+
+    pub(crate) fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        self.timeouts = timeouts.validate()?;
+        Ok(())
     }
 
     fn get_current_connection(&self) -> Result<Arc<Connection>> {
@@ -62,8 +69,10 @@ impl TcpTransport {
 
 impl ADBTransport for TcpTransport {
     fn connect(&mut self) -> Result<()> {
-        self.current_connection =
-            Some(Arc::new(Connection::new(TcpStream::connect(self.address)?)));
+        self.current_connection = Some(Arc::new(Connection::new(match self.timeouts.handshake {
+            Some(timeout) => TcpStream::connect_timeout(&self.address, timeout)?,
+            None => TcpStream::connect(self.address)?,
+        })));
         Ok(())
     }
 
@@ -76,6 +85,22 @@ impl ADBTransport for TcpTransport {
 }
 
 impl ADBMessageTransport for TcpTransport {
+    fn read_message(&mut self) -> Result<ADBTransportMessage> {
+        self.read_message_with_timeout(
+            self.timeouts
+                .read
+                .unwrap_or(crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT),
+        )
+    }
+    fn write_message(&mut self, message: ADBTransportMessage) -> Result<()> {
+        self.write_message_with_timeout(
+            message,
+            self.timeouts
+                .write
+                .unwrap_or(crate::message_devices::adb_message_transport::DEFAULT_READ_TIMEOUT),
+        )
+    }
+
     fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
         self.get_current_connection()?.read_message(timeout)
     }

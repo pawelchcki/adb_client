@@ -20,6 +20,8 @@ mod adb_transport_message;
 mod commands;
 mod message_commands;
 mod models;
+#[cfg(not(target_arch = "wasm32"))]
+mod packet_reader;
 mod utils;
 
 pub use utils::BinaryDecodable;

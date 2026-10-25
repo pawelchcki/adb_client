@@ -10,6 +10,8 @@ pub enum ADBHostCommand {
     DevicesLong,
     TrackDevices,
     HostFeatures,
+    DeviceFeatures(String),
+    TransportFeatures(u32),
     Connect(SocketAddrV4),
     Disconnect(SocketAddrV4),
     Pair(SocketAddrV4, String),
@@ -50,6 +52,8 @@ impl Display for ADBHostCommand {
                 )
             }
             Self::HostFeatures => write!(f, "host:features"),
+            Self::DeviceFeatures(serial) => write!(f, "host-serial:{serial}:features"),
+            Self::TransportFeatures(id) => write!(f, "host-transport-id:{id}:features"),
         }
     }
 }

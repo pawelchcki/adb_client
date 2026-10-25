@@ -38,6 +38,16 @@ impl TryFrom<u8> for ShellChannel {
 }
 
 impl ADBDeviceExt for ADBServerDevice {
+    fn exec_out(&mut self, command: &str, output: &mut dyn Write) -> Result<()> {
+        self.set_serial_transport()?;
+        self.transport
+            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::Exec(
+                command.to_owned(),
+            )))?;
+        std::io::copy(&mut self.transport.get_raw_connection()?, output)?;
+        Ok(())
+    }
+
     fn shell_command(
         &mut self,
         command: &dyn AsRef<str>,

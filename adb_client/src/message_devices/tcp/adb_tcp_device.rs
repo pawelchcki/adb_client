@@ -25,16 +25,53 @@ impl ADBTcpDevice {
         address: A,
         private_key_path: P,
     ) -> Result<Self> {
+        Self::new_with_custom_private_key_and_timeouts(
+            address,
+            private_key_path,
+            crate::ADBTimeouts::default(),
+        )
+    }
+
+    /// Connect with explicit handshake and command I/O timeouts.
+    pub fn new_with_timeouts<A: Into<SocketAddr>>(
+        address: A,
+        timeouts: crate::ADBTimeouts,
+    ) -> Result<Self> {
+        Self::new_with_custom_private_key_and_timeouts(
+            address,
+            get_default_adb_key_path()?,
+            timeouts,
+        )
+    }
+
+    /// Connect with a custom private key and explicit I/O timeouts.
+    pub fn new_with_custom_private_key_and_timeouts<P: AsRef<Path>, A: Into<SocketAddr>>(
+        address: A,
+        private_key_path: P,
+        timeouts: crate::ADBTimeouts,
+    ) -> Result<Self> {
+        let mut transport = TcpTransport::new(address, &private_key_path);
+        transport.set_timeouts(timeouts)?;
         Ok(Self {
-            inner: ADBMessageDevice::new(
-                TcpTransport::new(address, &private_key_path),
+            inner: ADBMessageDevice::new_with_handshake_timeout(
+                transport,
                 private_key_path,
+                timeouts.handshake,
             )?,
         })
+    }
+
+    /// Change subsequent command I/O timeouts on this connection.
+    pub fn set_timeouts(&mut self, timeouts: crate::ADBTimeouts) -> Result<()> {
+        self.inner.get_transport_mut().set_timeouts(timeouts)
     }
 }
 
 impl ADBDeviceExt for ADBTcpDevice {
+    fn exec_out(&mut self, command: &str, output: &mut dyn Write) -> Result<()> {
+        self.inner.exec_out(command, output)
+    }
+
     #[inline]
     fn shell_command(
         &mut self,
