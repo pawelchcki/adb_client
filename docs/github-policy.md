@@ -28,7 +28,8 @@ Runnerless is connected or that review checks are being delivered.
 
 Connect pawelchcki/adb_client (GitHub ID 1182595109) to the existing Runnerless
 workspace with an App installation covering this repository. Enable management of
-the Codex review gate, with administrator bypass disabled. Request reviews using
+the Codex review gate. The owner has enabled Runnerless's administrator review
+bypass; native GitHub branch rules retain an empty bypass-actor list. Request reviews using
 @codex review; a request alone does not satisfy the gate. The checked-in
 .runnerless-ci.ts declares conventional PR-title validation and no runtime jobs.
 A proposed branch grants no application authority.

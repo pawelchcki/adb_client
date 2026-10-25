@@ -68,6 +68,6 @@
   "runnerless": {
     "review_gate": true,
     "auto_review": false,
-    "admin_bypass": false
+    "admin_bypass": true
   }
 }

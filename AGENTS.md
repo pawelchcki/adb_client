@@ -6,8 +6,10 @@ its rationale and validation in the PR description.
 
 The default branch permits squash merges only, with the PR title and description
 used as the squash commit title and body. All review conversations must be
-resolved. Administrators have no bypass; force pushes and branch deletion are
-blocked on main.
+resolved. Native GitHub branch rules have no administrator bypass; force pushes
+and branch deletion are blocked on main. The owner has enabled Runnerless's
+administrator review bypass. Still obtain a real current-head Codex review and
+verify all applicable checks before merging.
 
 Require codex/review-gate and ci-toolkit/pull-request-title from GitHub App
 integration 4602759 on the current PR head. Request a real Codex review using
