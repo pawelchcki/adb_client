@@ -201,7 +201,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// Open a new ADB session with the given local command.
     pub(crate) fn open_session(&mut self, cmd: &ADBLocalCommand) -> Result<ADBSession<T>> {
         let mut rng = rand::rng();
-        let local_id: u32 = rng.random();
+        let local_id: u32 = rng.random_range(1..=u32::MAX);
 
         // adbd used to expect a null-terminated string.
         // keep doing so to maintain compatibility with older versions.
@@ -219,31 +219,40 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         )?;
         self.transport.write_message(message)?;
 
-        let response = self.transport.read_message()?;
-
-        if response.header().command() != MessageCommand::Okay {
-            return Err(RustADBError::ADBRequestFailed(format!(
-                "Open session failed: got {} in response instead of OKAY",
-                response.header().command()
-            )));
+        loop {
+            let response = self.transport.read_message()?;
+            match response.header().command() {
+                MessageCommand::Okay | MessageCommand::Write | MessageCommand::Clse => {
+                    if response.header().arg1() != local_id {
+                        // These frames belonged to a stream that was already closed.
+                        continue;
+                    }
+                }
+                command => {
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "Open session failed: unexpected {command}"
+                    )));
+                }
+            }
+            match response.header().command() {
+                MessageCommand::Okay if response.header().arg0() != 0 => {
+                    return Ok(ADBSession::new(
+                        self.transport.clone(),
+                        local_id,
+                        response.header().arg0(),
+                        self.max_payload_size,
+                    ));
+                }
+                command => {
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "Open session failed: invalid {command} for local_id {local_id}"
+                    )));
+                }
+            }
         }
-
-        if response.header().arg1() != local_id {
-            return Err(RustADBError::ADBRequestFailed(format!(
-                "Open session failed: responses used {} for our local_id instead of {local_id}",
-                response.header().arg1()
-            )));
-        }
-
-        Ok(ADBSession::new(
-            self.transport.clone(),
-            local_id,
-            response.header().arg0(),
-            self.max_payload_size,
-        ))
     }
 
-    pub(crate) fn end_transaction(&mut self, session: &mut ADBSession<T>) -> Result<()> {
+    pub(crate) fn end_transaction(session: &mut ADBSession<T>) -> Result<()> {
         let quit_buffer = MessageSubcommand::Quit.with_arg(0u32);
         session.send_and_expect_okay(ADBTransportMessage::try_new(
             MessageCommand::Write,
@@ -252,7 +261,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             &quit_buffer.encode(),
         )?)?;
 
-        let _discard_close = self.transport.read_message()?;
+        session
+            .read_session_message()?
+            .assert_command(MessageCommand::Clse)?;
         Ok(())
     }
 }

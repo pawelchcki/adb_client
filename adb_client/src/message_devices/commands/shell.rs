@@ -32,12 +32,14 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         loop {
             let message = session.recv_and_reply_okay()?;
-            if message.header().command() == MessageCommand::Clse {
-                break;
-            }
-            // should this just write for ::Write messages?
-            if let Some(ref mut stdout) = stdout {
-                stdout.write_all(&message.into_payload())?;
+            match message.header().command() {
+                MessageCommand::Write => {
+                    if let Some(ref mut stdout) = stdout {
+                        stdout.write_all(message.payload())?;
+                    }
+                }
+                MessageCommand::Clse => break,
+                _ => {}
             }
         }
 
@@ -145,6 +147,15 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     ) -> Result<()> {
         loop {
             let message = transport.read_message()?;
+
+            if matches!(
+                message.header().command(),
+                MessageCommand::Write | MessageCommand::Okay | MessageCommand::Clse
+            ) && !crate::message_devices::adb_session::belongs_to_stream(
+                &message, local_id, remote_id,
+            ) {
+                continue;
+            }
 
             match message.header().command() {
                 MessageCommand::Write => {

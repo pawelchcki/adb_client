@@ -18,9 +18,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     pub(crate) fn list<A: AsRef<str>>(&mut self, path: A) -> Result<Vec<ADBListItemType>> {
         let mut session = self.open_synchronization_session()?;
 
-        let output = self.handle_list(&mut session, path);
+        let output = Self::handle_list(&mut session, path);
 
-        self.end_transaction(&mut session)?;
+        Self::end_transaction(&mut session)?;
         output
     }
 
@@ -71,7 +71,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                     &[],
                 )?)?;
 
-            *payload = session.get_transport_mut().read_message()?.into_payload();
+            let response = session.read_session_message()?;
+            response.assert_command(MessageCommand::Write)?;
+            *payload = response.into_payload();
 
             let bytes_read_from_new_payload = requested_bytes - bytes_read_from_existing_payload;
             slice.extend_from_slice(&payload[..bytes_read_from_new_payload]);
@@ -81,7 +83,6 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     }
 
     fn handle_list<A: AsRef<str>>(
-        &mut self,
         session: &mut ADBSession<T>,
         path: A,
     ) -> Result<Vec<ADBListItemType>> {
@@ -109,8 +110,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         let mut list_items = Vec::new();
 
-        let transport = self.get_transport_mut();
-        let mut payload = transport.read_message()?.into_payload();
+        let response = session.read_session_message()?;
+        response.assert_command(MessageCommand::Write)?;
+        let mut payload = response.into_payload();
         let mut current_index = 0;
         loop {
             // Loop though the response for all the entries
